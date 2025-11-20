@@ -17,6 +17,7 @@ defmodule Microlsm.MixProject do
 
   defp deps do
     [
+      {:nimble_pool, "~> 1.1.0"},
       {:eflambe, "~> 0.3.2", only: [:dev, :test]},
       {:dialyxir, "~> 1.4.6", only: :dev, runtime: false}
     ]

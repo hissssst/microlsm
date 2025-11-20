@@ -10,6 +10,8 @@ defmodule Microlsm do
   alias Microlsm.Memtable
   alias Microlsm.Wal
 
+  @call_timeout 15_000
+
   @type key :: any()
 
   @type value :: any()
@@ -37,17 +39,33 @@ defmodule Microlsm do
 
   @spec write(t(), key(), value()) :: :ok
   def write(name, key, value) do
-    GenServer.call(name, {:write, key, {value}}, 1000000)
+    GenServer.call(name, {:write, key, {value}}, @call_timeout)
+  end
+
+  @spec async_write(t(), key(), value()) :: :ok
+  def async_write(name, key, value) do
+    {memtable, _indices_table} = :persistent_term.get({__MODULE__, name})
+    Memtable.write(memtable, [{key, {value}}])
+    GenServer.cast(name, {:async_write, key, {value}})
+    :ok
   end
 
   @spec delete(t(), key()) :: :ok
   def delete(name, key) do
-    GenServer.call(name, {:write, key, {}}, 1000000)
+    GenServer.call(name, {:write, key, {}}, @call_timeout)
+  end
+
+  @spec async_delete(t(), key()) :: :ok
+  def async_delete(name, key) do
+    {memtable, _indices_table} = :persistent_term.get({__MODULE__, name})
+    Memtable.write(memtable, [{key, {}}])
+    GenServer.cast(name, {:async_write, key, {}})
+    :ok
   end
 
   @spec batch(t(), [batch_operation()]) :: :ok
   def batch(name, ops) do
-    GenServer.call(name, {:batch, ops})
+    GenServer.call(name, {:batch, ops}, @call_timeout)
   end
 
   @spec read(t(), key()) :: {:ok, value()} | :error
@@ -223,7 +241,7 @@ defmodule Microlsm do
 
     memtable = Memtable.new()
 
-    indices_table = :ets.new(:microlsm_indices, [:public, :ordered_set])
+    indices_table = :ets.new(:microlsm_indices, [:public, :ordered_set, read_concurrency: true, write_concurrency: false])
     :persistent_term.put({__MODULE__, name}, {memtable, indices_table})
 
     {:ok, wal_fd} = :prim_file.open(wal_filename, [:read, :write, :sync, :append])
@@ -297,11 +315,21 @@ defmodule Microlsm do
   end
 
   def handle_call({:write, key, value}, from, state) do
+    %{reply_tos: reply_tos} = state
+    state = %{state | reply_tos: [from | reply_tos]}
+    do_handle_write(key, value, state)
+  end
+
+  def handle_cast({:async_write, key, value}, state) do
+    do_handle_write(key, value, state)
+  end
+
+  @compile {:inline, do_handle_write: 3}
+  defp do_handle_write(key, value, state) do
     %{
       batch_length: batch_length,
       max_batch_length: max_batch_length,
-      batch: batch,
-      reply_tos: reply_tos
+      batch: batch
     } = state
 
     batch_length = batch_length + 1
@@ -309,8 +337,7 @@ defmodule Microlsm do
     state = %{
       state
       | batch_length: batch_length,
-        batch: [{key, value} | batch],
-        reply_tos: [from | reply_tos]
+        batch: [{key, value} | batch]
     }
 
     if batch_length >= max_batch_length do
@@ -342,11 +369,12 @@ defmodule Microlsm do
 
     Wal.push_batch(wal_fd, batch)
     Memtable.write(memtable, batch)
+    :erlang.garbage_collect()
 
     state =
       if Memtable.memory(memtable) > threshold do
-        :eflambe.apply({__MODULE__, :dump, [state]}, output_directory: ~c"flamegraphs")
-        # dump(state)
+        # :eflambe.apply({__MODULE__, :dump, [state]}, output_directory: ~c"flamegraphs")
+        dump(state)
       else
         state
       end
@@ -388,8 +416,12 @@ defmodule Microlsm do
         Path.join(data_dir, "disktables")
       )
 
-    :ets.delete_all_objects(indices_table)
+    # TODO these lines need optimization
+    generations_to_delete = Enum.map(indices, &:erlang.element(1, &1)) -- Enum.map(new_indices, &:erlang.element(1, &1))
     :ets.insert(indices_table, new_indices)
+    for generation <- generations_to_delete do
+      :ets.delete(indices_table, generation)
+    end
 
     for {fd, filename} <- to_delete do
       :prim_file.close(fd)

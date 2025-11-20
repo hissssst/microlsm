@@ -212,8 +212,12 @@ defmodule Microlsm.Disktable do
   ## Writing
 
   def write_stream(stream, fd, length, block_count) do
-    nth = div(length, block_count)
+    nth = max(div(length, block_count), 10)
     offset = write_header(fd, List.duplicate(0, block_count * 2), 0)
+
+    # IO.inspect length, label: :length
+    # IO.inspect block_count, label: :block_count
+    # IO.inspect nth, label: :nth
 
     {offset, last_key, last_encoded_value, key_to_blocks, len, bloom_filter} =
       stream
@@ -246,7 +250,7 @@ defmodule Microlsm.Disktable do
     index = index(key_to_blocks)
     block_offsets = Enum.map(key_to_blocks, fn {_, offset} -> offset end)
     write_header(fd, block_offsets, len)
-    :prim_file.sync(fd)
+    :prim_file.datasync(fd)
     bloom_filter = BloomFilter.finalize(bloom_filter)
     {index, bloom_filter}
   end
@@ -380,13 +384,18 @@ defmodule Microlsm.Disktable do
   ## Header
 
   defp write_header(fd, block_offsets, len) do
-    header =
-      for offset <- block_offsets,
-          do: <<offset::64>>,
-          into: <<len::64, length(block_offsets)::64>>
-
+    block_count = length(block_offsets)
+    header = [<<len::64, block_count::64>> | encode_offsets(block_offsets)]
     :ok = :prim_file.pwrite(fd, 0, header)
-    byte_size(header)
+    block_count * 8 + 16
+  end
+
+  defp encode_offsets([offset]) do
+    [<<offset::64>>]
+  end
+
+  defp encode_offsets([offset | rest]) do
+    [<<offset::64>> | encode_offsets(rest)]
   end
 
   defp read_header(fd, readsize) do

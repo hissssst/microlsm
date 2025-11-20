@@ -61,9 +61,14 @@ defmodule MicrolsmTest do
     )
 
     n = 5 * 1024
+    shuffled = Enum.shuffle(1..n)
 
-    for i <- Enum.shuffle(1..n) do
-      assert :ok = Microlsm.write(name, i, "value_#{i}")
+    IO.inspect :timer.tc fn ->
+      for i <- shuffled do
+        assert :ok = Microlsm.write(name, i, "value_#{i}")
+      end
+
+      :ok
     end
 
     for i <- Enum.shuffle(1..n) do
