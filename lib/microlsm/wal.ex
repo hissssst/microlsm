@@ -5,9 +5,9 @@ defmodule Microlsm.Wal do
   @batch_read_size 10 * 1024 * 1024
 
   def push_batch(fd, ops) do
-    encoded = for op <- ops, into: "", do: encode_op(op)
+    encoded = for op <- ops, do: encode_op(op)
     :ok = :prim_file.write(fd, encoded)
-    byte_size(encoded)
+    :ok = :prim_file.datasync(fd)
   end
 
   def stream(fd) do

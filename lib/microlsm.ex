@@ -10,6 +10,8 @@ defmodule Microlsm do
   alias Microlsm.Memtable
   alias Microlsm.Wal
 
+  import :erlang, only: [term_to_binary: 1, binary_to_term: 1, element: 2, garbage_collect: 0]
+
   @call_timeout 15_000
 
   @type key :: any()
@@ -44,8 +46,6 @@ defmodule Microlsm do
 
   @spec async_write(t(), key(), value()) :: :ok
   def async_write(name, key, value) do
-    {memtable, _indices_table} = :persistent_term.get({__MODULE__, name})
-    Memtable.write(memtable, [{key, {value}}])
     GenServer.cast(name, {:async_write, key, {value}})
     :ok
   end
@@ -57,21 +57,25 @@ defmodule Microlsm do
 
   @spec async_delete(t(), key()) :: :ok
   def async_delete(name, key) do
-    {memtable, _indices_table} = :persistent_term.get({__MODULE__, name})
-    Memtable.write(memtable, [{key, {}}])
     GenServer.cast(name, {:async_write, key, {}})
     :ok
   end
 
   @spec batch(t(), [batch_operation()]) :: :ok
-  def batch(name, ops) do
-    GenServer.call(name, {:batch, ops}, @call_timeout)
+  def batch(name, batch) do
+    batch =
+      Enum.map(batch, fn
+        {:write, key, value} -> {key, {value}}
+        {:delete, key} -> {key, {}}
+      end)
+
+    GenServer.call(name, {:batch, batch}, @call_timeout)
   end
 
   @spec read(t(), key()) :: {:ok, value()} | :error
   def read(name, key) do
     maybe_raise_when_no_table(name)
-    {memtable, indices_table} = :persistent_term.get({__MODULE__, name})
+    {memtable, indices_table} = get_memtable_and_indices_table(name)
     indices = :ets.tab2list(indices_table)
 
     result =
@@ -107,7 +111,7 @@ defmodule Microlsm do
       end)
       |> Stream.flat_map(fn
         {key, binary} when is_binary(binary) ->
-          case :erlang.binary_to_term(binary) do
+          case binary_to_term(binary) do
             {} -> []
             {value} -> [{key, value}]
           end
@@ -123,6 +127,17 @@ defmodule Microlsm do
 
     Microlsm.Stream.after_hook(stream, fn ->
       Enum.each(fds, &:prim_file.close/1)
+    end)
+  end
+
+  @doc """
+  Ranges must be sorted
+  """
+  @spec ranges_read(t(), [{key(), key()}]) :: Enumerable.t({key(), value()})
+  def ranges_read(name, [{left_key, right_key} | ranges]) do
+    Enum.reduce(ranges, range_read(name, left_key, right_key), fn {left_key, right_key}, stream ->
+      range_stream = range_read(name, left_key, right_key)
+      Stream.concat(stream, range_stream)
     end)
   end
 
@@ -142,7 +157,7 @@ defmodule Microlsm do
       end)
       |> Stream.flat_map(fn
         {key, binary} when is_binary(binary) ->
-          case :erlang.binary_to_term(binary) do
+          case binary_to_term(binary) do
             {} -> []
             {value} -> [{key, value}]
           end
@@ -197,7 +212,7 @@ defmodule Microlsm do
   ## Debug functions
 
   def location(name, key) do
-    {memtable, indices_table} = :persistent_term.get({__MODULE__, name})
+    {memtable, indices_table} = get_memtable_and_indices_table(name)
     indices = :ets.tab2list(indices_table)
 
     case Memtable.read(memtable, key) |> IO.inspect(label: :mt) do
@@ -244,7 +259,7 @@ defmodule Microlsm do
     indices_table = :ets.new(:microlsm_indices, [:public, :ordered_set, read_concurrency: true, write_concurrency: false])
     :persistent_term.put({__MODULE__, name}, {memtable, indices_table})
 
-    {:ok, wal_fd} = :prim_file.open(wal_filename, [:read, :write, :sync, :append])
+    {:ok, wal_fd} = :prim_file.open(wal_filename, [:read, :append])
 
     wal_fd
     |> Wal.stream()
@@ -292,12 +307,6 @@ defmodule Microlsm do
     } = state
 
     batch_length = batch_length + length(in_batch)
-
-    in_batch =
-      Enum.map(in_batch, fn
-        {:write, key, value} -> {key, {value}}
-        {:delete, key} -> {key, {}}
-      end)
 
     state = %{
       state
@@ -350,7 +359,6 @@ defmodule Microlsm do
 
   def handle_info(:timeout, state) do
     state = run_batch(state)
-    state = %{state | batch: [], reply_tos: [], batch_length: 0}
     {:noreply, state}
   end
 
@@ -369,19 +377,19 @@ defmodule Microlsm do
 
     Wal.push_batch(wal_fd, batch)
     Memtable.write(memtable, batch)
-    :erlang.garbage_collect()
+    garbage_collect()
 
     state =
       if Memtable.memory(memtable) > threshold do
-        # :eflambe.apply({__MODULE__, :dump, [state]}, output_directory: ~c"flamegraphs")
-        dump(state)
+        :eflambe.apply({__MODULE__, :dump, [state]}, output_directory: ~c"flamegraphs")
+        # dump(state)
       else
         state
       end
 
     for reply_to <- reply_tos, do: GenServer.reply(reply_to, :ok)
 
-    %{state | batch: []}
+    %{state | batch: [], reply_tos: [], batch_length: 0}
   end
 
   def dump(state) do
@@ -395,41 +403,43 @@ defmodule Microlsm do
       block_count: block_count
     } = state
 
-    {^memtable, indices_table} = :persistent_term.get({__MODULE__, name})
-    indices = :ets.tab2list(indices_table)
+    spawn_link(fn ->
+      {^memtable, indices_table} = :persistent_term.get({__MODULE__, name})
+      indices = :ets.tab2list(indices_table)
 
-    stream =
-      memtable
-      |> Memtable.stream(memtable_read_ahead)
-      |> Stream.map(fn {key, value} ->
-        {key, :erlang.term_to_binary(value)}
-      end)
+      vencoded_memtable_stream =
+        memtable
+        |> Memtable.stream(memtable_read_ahead)
+        |> Stream.map(fn {key, value} ->
+          {key, term_to_binary(value)}
+        end)
 
-    {new_indices, to_delete} =
-      merge(
-        indices,
-        Memtable.size(memtable),
-        0,
-        [],
-        stream,
-        block_count,
-        Path.join(data_dir, "disktables")
-      )
+      {new_indices, to_delete} =
+        merge(
+          indices,
+          Memtable.size(memtable),
+          0,
+          [],
+          vencoded_memtable_stream,
+          block_count,
+          Path.join(data_dir, "disktables")
+        )
 
-    # TODO these lines need optimization
-    generations_to_delete = Enum.map(indices, &:erlang.element(1, &1)) -- Enum.map(new_indices, &:erlang.element(1, &1))
-    :ets.insert(indices_table, new_indices)
-    for generation <- generations_to_delete do
-      :ets.delete(indices_table, generation)
-    end
+      # TODO these lines need optimization
+      generations_to_delete = Enum.map(indices, &element(1, &1)) -- Enum.map(new_indices, &element(1, &1))
+      :ets.insert(indices_table, new_indices)
+      for generation <- generations_to_delete do
+        :ets.delete(indices_table, generation)
+      end
 
-    for {fd, filename} <- to_delete do
-      :prim_file.close(fd)
-      :prim_file.delete(filename)
-    end
+      for {fd, filename} <- to_delete do
+        :prim_file.close(fd)
+        :prim_file.delete(filename)
+      end
 
-    Memtable.clear(memtable)
-    :prim_file.truncate(wal_fd)
+      Memtable.clear(memtable)
+      :prim_file.truncate(wal_fd)
+    end)
 
     state
   end
@@ -461,7 +471,7 @@ defmodule Microlsm do
     )
   end
 
-  @encoded_delete :erlang.term_to_binary({})
+  @encoded_delete term_to_binary({})
 
   defp merge(indices, length, generation, to_delete, stream, block_count, disktables_dir) do
     filename = Path.join(disktables_dir, Integer.to_string(generation))
@@ -486,10 +496,26 @@ defmodule Microlsm do
   defp build_bloom_filter(fd, index, length) do
     bitsize = 10 * length
     k = 6
+    filter = BloomFilter.new(bitsize, k)
 
     fd
     |> Disktable.stream(index)
-    |> Stream.map(fn {key, _value} -> key end)
-    |> BloomFilter.build(bitsize, k)
+    |> Enum.reduce(filter, fn {key, _value}, filter -> BloomFilter.add(filter, key) end)
+    |> BloomFilter.finalize()
+  end
+
+  defp swap_memtables(name) do
+    {atomics_ref, _mt1, _mt2, _indices} = :persistent_term.get({__MODULE__, name})
+    old = :atomics.get(atomics_ref, 1)
+    new = 1 - old
+    :ok = :atomics.compare_exchange(atomics_ref, 1, old, new)
+  end
+
+  defp get_memtable_and_indices_table(name) do
+    {atomics_ref, mt1, mt2, it1, it2} = :persistent_term.get({__MODULE__, name})
+    case :atomics.get(atomics_ref, 1) do
+      0 -> {mt1, it1}
+      1 -> {mt2, it2}
+    end
   end
 end

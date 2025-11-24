@@ -16,25 +16,10 @@ defmodule Microlsm.Disktable do
   end
 
   def stream(fd) do
-    Stream.resource(
-      fn ->
-        {_length, block_offsets} = read_header(fd, @header_read_size)
-        block_offsets
-      end,
-      fn
-        [] ->
-          {:halt, []}
-
-        [last_offset] ->
-          {[read_kv(fd, last_offset, @keyread_size)], []}
-
-        [first_offset, second_offset | block_offsets] ->
-          size = second_offset - first_offset
-          {:ok, block} = :prim_file.pread(fd, first_offset, size)
-          {list_block(block), [second_offset | block_offsets]}
-      end,
-      fn _ -> :ok end
-    )
+    fn acc, fun ->
+      {_length, block_offsets} = read_header(fd, @header_read_size)
+      do_stream(block_offsets, fd, acc, fun)
+    end
   end
 
   def stream(fd, index) do
@@ -43,22 +28,53 @@ defmodule Microlsm.Disktable do
         offset
       end
 
-    Stream.resource(
-      fn -> block_offsets end,
-      fn
-        [] ->
-          {:halt, []}
+    fn acc, fun ->
+      do_stream(block_offsets, fd, acc, fun)
+    end
+  end
 
-        [last_offset] ->
-          {[read_kv(fd, last_offset, @keyread_size)], []}
+  defp do_stream(block_offsets, fd, {:suspend, iacc}, fun) do
+    cont = fn acc -> do_stream(block_offsets, fd, acc, fun) end
+    {:suspended, iacc, cont}
+  end
 
-        [first_offset, second_offset | block_offsets] ->
-          size = second_offset - first_offset
-          {:ok, block} = :prim_file.pread(fd, first_offset, size)
-          {list_block(block), [second_offset | block_offsets]}
-      end,
-      fn _ -> :ok end
-    )
+  defp do_stream(_block_offsets, _fd, {:halt, iacc}, _fun) do
+    {:halted, iacc}
+  end
+
+  defp do_stream([last_offset], fd, {:cont, iacc}, fun) do
+    acc = fun.(read_kv(fd, last_offset, @keyread_size), iacc)
+    do_stream([], fd, acc, fun)
+  end
+
+  defp do_stream([], _fd, {:cont, iacc}, _fun) do
+    {:done, iacc}
+  end
+
+  defp do_stream([first_offset, second_offset | block_offsets], fd, {:cont, iacc}, fun) do
+    size = second_offset - first_offset
+    {:ok, block} = :prim_file.pread(fd, first_offset, size)
+    pairs = list_block(block)
+    block_offsets = [second_offset | block_offsets]
+    do_stream_items(pairs, block_offsets, fd, {:cont, iacc}, fun)
+  end
+
+  defp do_stream_items(pairs, block_offsets, fd, {:suspend, iacc}, fun) do
+    cont = fn acc -> do_stream_items(pairs, block_offsets, fd, acc, fun) end
+    {:suspended, iacc, cont}
+  end
+
+  defp do_stream_items(_pairs, _block_offsets, _fd, {:halt, iacc}, _fun) do
+    {:halted, iacc}
+  end
+
+  defp do_stream_items([], block_offsets, fd, {:cont, iacc}, fun) do
+    do_stream(block_offsets, fd, {:cont, iacc}, fun)
+  end
+
+  defp do_stream_items([pair | pairs], block_offsets, fd, {:cont, iacc}, fun) do
+    acc = fun.(pair, iacc)
+    do_stream_items(pairs, block_offsets, fd, acc, fun)
   end
 
   def range_stream(fd, index, left_key, right_key) do

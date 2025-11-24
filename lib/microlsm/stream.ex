@@ -12,8 +12,27 @@ defmodule Microlsm.Stream do
           hook.()
           {tag, result}
 
-        other ->
-          other
+        {:suspended, result, cont} ->
+          {:suspended, result, do_cont_after_hook(cont, hook)}
+      catch
+        class, reason ->
+          hook.()
+          :erlang.raise(class, reason, __STACKTRACE__)
+      end
+    end
+  end
+
+  defp do_cont_after_hook(cont, hook) do
+    fn acc ->
+      try do
+        cont.(acc)
+      else
+        {tag, result} ->
+          hook.()
+          {tag, result}
+
+        {:suspended, result, cont} ->
+          {:suspended, result, do_cont_after_hook(cont, hook)}
       catch
         class, reason ->
           hook.()
@@ -30,112 +49,135 @@ defmodule Microlsm.Stream do
     fn acc, func -> Enumerable.reduce(enumerable, acc, func) end
   end
 
-  # Merges two ordered streams of pairs into a single ordered stream of pairs
-  # When both streams have the same key, left one is chosen and right one is dropped
   def merge_streams(lenum, renum) do
     lstream = to_func(lenum)
     rstream = to_func(renum)
     lclos = fn acc -> lstream.(acc, fn elem, _acc -> {:suspend, elem} end) end
     rclos = fn acc -> rstream.(acc, fn elem, _acc -> {:suspend, elem} end) end
 
-    Stream.resource(
-      fn -> :first end,
-      fn
-        :first ->
-          case lclos.({:cont, []}) do
-            {:suspended, {left_key, left_value}, lclos} ->
-              case rclos.({:cont, []}) do
-                {:suspended, {right_key, right_value}, rclos} ->
-                  cmerge(left_key, left_value, right_key, right_value, lclos, rclos)
-
-                {_, {right_key, right_value}} ->
-                  cmerge(left_key, left_value, right_key, right_value, lclos, done_clos())
-
-                {_, []} ->
-                  {[{left_key, left_value}], {:dump, lclos}}
-              end
-
-            {_, {left_key, left_value}} ->
-              case rclos.({:cont, []}) do
-                {:suspended, {right_key, right_value}, rclos} ->
-                  cmerge(left_key, left_value, right_key, right_value, done_clos(), rclos)
-
-                {_, {right_key, right_value}} ->
-                  cmerge(left_key, left_value, right_key, right_value, done_clos(), done_clos())
-
-                {_, []} ->
-                  {[{left_key, left_value}], :end}
-              end
-
-            {_, []} ->
-              {[], {:dump, rclos}}
-          end
-
-        {:dump, clos} ->
-          case clos.({:cont, []}) do
-            {:suspended, {key, value}, clos} ->
-              {[{key, value}], {:dump, clos}}
-
-            {_, {key, value}} ->
-              {[{key, value}], :end}
-
-            {_, []} ->
-              {:halt, :end}
-          end
-
-        {:left, left_key, left_value, lclos, rclos} ->
+    fn acc, fun ->
+      case lclos.({:cont, []}) do
+        {:suspended, {left_key, left_value}, lclos} ->
           case rclos.({:cont, []}) do
             {:suspended, {right_key, right_value}, rclos} ->
-              cmerge(left_key, left_value, right_key, right_value, lclos, rclos)
+              do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun)
 
             {_, {right_key, right_value}} ->
-              cmerge(left_key, left_value, right_key, right_value, lclos, done_clos())
+              do_merge(left_key, left_value, right_key, right_value, lclos, done_clos(), acc, fun)
 
             {_, []} ->
-              {[{left_key, left_value}], {:dump, lclos}}
+              dump(left_key, left_value, lclos, acc, fun)
           end
 
-        {:right, right_key, right_value, lclos, rclos} ->
-          case lclos.({:cont, []}) do
-            {:suspended, {left_key, left_value}, lclos} ->
-              cmerge(left_key, left_value, right_key, right_value, lclos, rclos)
+        {_, {left_key, left_value}} ->
+          case rclos.({:cont, []}) do
+            {:suspended, {right_key, right_value}, rclos} ->
+              do_merge(left_key, left_value, right_key, right_value, done_clos(), rclos, acc, fun)
 
-            {_, {left_key, left_value}} ->
-              cmerge(left_key, left_value, right_key, right_value, done_clos(), rclos)
+            {_, {right_key, right_value}} ->
+              do_merge(left_key, left_value, right_key, right_value, done_clos(), done_clos(), acc, fun)
 
             {_, []} ->
-              {[{right_key, right_value}], {:dump, rclos}}
+              dump(left_key, left_value, done_clos(), acc, fun)
           end
 
-        :end ->
-          {:halt, []}
-      end,
-      fn _ -> [] end
-    )
-  end
-
-  defp cmerge(left_key, left_value, right_key, right_value, lclos, rclos)
-       when left_key < right_key do
-    {[{left_key, left_value}], {:right, right_key, right_value, lclos, rclos}}
-  end
-
-  defp cmerge(left_key, left_value, right_key, _right_value, lclos, rclos)
-       when left_key == right_key do
-    case rclos.({:cont, []}) do
-      {:suspended, {right_key, right_value}, rclos} ->
-        {[{left_key, left_value}], {:right, right_key, right_value, lclos, rclos}}
-
-      {_, {right_key, right_value}} ->
-        {[{left_key, left_value}], {:right, right_key, right_value, lclos, done_clos()}}
-
-      {_, []} ->
-        {[{left_key, left_value}], {:dump, lclos}}
+        {_, []} ->
+          dump(rclos, acc, fun)
+      end
     end
   end
 
-  defp cmerge(left_key, left_value, right_key, right_value, lclos, rclos)
-       when left_key > right_key do
-    {[{right_key, right_value}], {:left, left_key, left_value, lclos, rclos}}
+  defp dump(key, value, clos, {:cont, iacc}, fun) do
+    acc = fun.({key, value}, iacc)
+    dump(clos, acc, fun)
+  end
+
+  defp dump(_key, _value, clos, {:halt, iacc}, _fun) do
+    clos.({:halt, iacc})
+    {:halted, iacc}
+  end
+
+  defp dump(key, value, clos, {:suspend, iacc}, fun) do
+    cont = fn acc -> dump(key, value, clos, acc, fun) end
+    {:suspended, iacc, cont}
+  end
+
+  defp dump(clos, {:suspend, iacc}, fun) do
+    {:suspended, iacc, fn acc -> dump(clos, acc, fun) end}
+  end
+
+  defp dump(clos, {:halt, iacc}, _fun) do
+    clos.({:halt, iacc})
+    {:halted, iacc}
+  end
+
+  defp dump(clos, {:cont, iacc}, fun) do
+    case clos.({:cont, []}) do
+      {:suspended, {key, value}, clos} ->
+        acc = fun.({key, value}, iacc)
+        dump(clos, acc, fun)
+
+      {_, {key, value}} ->
+        acc = fun.({key, value}, iacc)
+        dump(done_clos(), acc, fun)
+
+      {_, []} ->
+        {:done, iacc}
+    end
+  end
+
+  defp do_merge(left_key, left_value, right_key, right_value, lclos, rclos, {:cont, iacc}, fun) do
+    case left_key do
+      left_key when left_key < right_key ->
+        acc = fun.({left_key, left_value}, iacc)
+        case lclos.({:cont, []}) do
+          {:suspended, {left_key, left_value}, lclos} ->
+            do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun)
+
+          {_done_or_halted, {left_key, left_value}} ->
+            do_merge(left_key, left_value, right_key, right_value, done_clos(), rclos, acc, fun)
+
+          {_done_or_halted, []} ->
+            dump(right_key, right_value, rclos, acc, fun)
+        end
+
+      left_key when left_key == right_key ->
+        acc = {:cont, iacc}
+        case rclos.({:cont, []}) do
+          {:suspended, {right_key, right_value}, rclos} ->
+            do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun)
+
+          {_done_or_halted, {right_key, right_value}} ->
+            do_merge(left_key, left_value, right_key, right_value, lclos, done_clos(), acc, fun)
+
+          {_done_or_halted, []} ->
+            dump(left_key, left_value, lclos, acc, fun)
+        end
+
+      left_key when left_key > right_key ->
+        acc = fun.({right_key, right_value}, iacc)
+        case rclos.({:cont, []}) do
+          {:suspended, {right_key, right_value}, rclos} ->
+            do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun)
+
+          {_done_or_halted, {right_key, right_value}} ->
+            do_merge(left_key, left_value, right_key, right_value, lclos, done_clos(), acc, fun)
+
+          {_done_or_halted, []} ->
+            dump(left_key, left_value, lclos, acc, fun)
+        end
+    end
+  end
+
+  defp do_merge(_left_key, _left_value, _right_key, _right_value, lclos, rclos, {:halt, iacc}, _fun) do
+    lclos.({:halt, iacc})
+    rclos.({:halt, iacc})
+    {:halted, iacc}
+  end
+
+  defp do_merge(left_key, left_value, right_key, right_value, lclos, rclos, {:suspend, iacc}, fun) do
+    cont = fn acc -> do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun) end
+    {:suspended, iacc, cont}
   end
 
   defp done_clos do
