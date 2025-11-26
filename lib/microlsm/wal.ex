@@ -4,10 +4,18 @@ defmodule Microlsm.Wal do
   # 10MB
   @batch_read_size 10 * 1024 * 1024
 
+  # Literally infinite size of an operation
+  @opsize_size 64
+
   def push_batch(fd, ops) do
     encoded = for op <- ops, do: encode_op(op)
     :ok = :prim_file.write(fd, encoded)
     :ok = :prim_file.datasync(fd)
+  end
+
+  def truncate(fd) do
+    :ok = :prim_file.truncate(fd)
+    :ok = :prim_file.sync(fd)
   end
 
   def stream(fd) do
@@ -27,7 +35,7 @@ defmodule Microlsm.Wal do
     )
   end
 
-  defp decode_ops(<<size::64, op::binary-size(size), tail::binary>>, acc, total_size, total_count) do
+  defp decode_ops(<<size::@opsize_size, op::binary-size(size), tail::binary>>, acc, total_size, total_count) do
     decode_ops(tail, [binary_to_term(op) | acc], total_size + size + 8, total_count + 1)
   end
 
@@ -37,6 +45,6 @@ defmodule Microlsm.Wal do
 
   defp encode_op(op) do
     encoded = term_to_binary(op)
-    <<byte_size(encoded)::64, encoded::binary>>
+    <<byte_size(encoded)::@opsize_size, encoded::binary>>
   end
 end

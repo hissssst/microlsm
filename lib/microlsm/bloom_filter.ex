@@ -76,6 +76,10 @@ defmodule Microlsm.BloomFilter do
     align_bytesize(bitsize) <<< 3
   end
 
+  defp align_bytesize(0) do
+    1
+  end
+
   defp align_bytesize(bitsize) do
     bytesize = bitsize >>> 3
     case bitsize &&& 0b111 do

@@ -1,5 +1,6 @@
 defmodule Microlsm.Stream do
   @moduledoc false
+  # Helpers for working with Elixir streams
 
   @compile {:inline, done_clos: 0}
 

@@ -13,6 +13,23 @@ defmodule MicrolsmTest do
     {:ok, name: name, data_dir: data_dir}
   end
 
+  @tag capture_log: true, capture_io: true
+  test "Lockfile works", %{name: name, data_dir: data_dir} do
+    assert {:ok, pid} = Microlsm.start_link(name: name, data_dir: data_dir)
+    refute_receive {:EXIT, _, _}
+
+    Process.flag(:trap_exit, true)
+    assert {:error, {%RuntimeError{message: message}, _}} = Microlsm.start_link(name: :other_name, data_dir: data_dir)
+    assert message == "Table is in use by #{inspect pid}"
+
+    Process.exit(pid, :kill)
+    refute Process.alive?(pid)
+    assert_receive {:EXIT, ^pid, :killed}
+
+    assert {:ok, _pid} = Microlsm.start_link(name: name, data_dir: data_dir)
+    refute_receive {:EXIT, _, _}
+  end
+
   test "Sets and reads", %{name: name, data_dir: data_dir} do
     Microlsm.start_link(name: name, data_dir: data_dir)
     assert :ok = Microlsm.write(name, "key", "value")
@@ -56,41 +73,44 @@ defmodule MicrolsmTest do
       name: name,
       data_dir: data_dir,
       max_batch_length: 100,
-      threshold: 512,
-      block_count: 10
+      threshold: 4 * 1_024,
+      block_count: 100
     )
 
-    n = 5 * 1024
+    times = 1
+    n = 10_000
     shuffled = Enum.shuffle(1..n)
 
-    IO.inspect :timer.tc fn ->
+    for _ <- 1..times do
       for i <- shuffled do
         assert :ok = Microlsm.write(name, i, "value_#{i}")
+      end
+
+      for i <- Enum.shuffle(1..n) do
+        assert :error == Microlsm.read(name, -i)
+        assert {:ok, "value_#{i}"} == Microlsm.read(name, i)
+      end
+
+      for i <- Enum.shuffle(1..n) do
+        assert :ok = Microlsm.write(name, i, "other_value_#{i}")
+      end
+
+      for i <- Enum.shuffle(1..n) do
+        assert {:ok, "other_value_#{i}"} == Microlsm.read(name, i)
+      end
+
+      for i <- Enum.shuffle(1..n) do
+        assert :ok = Microlsm.delete(name, i)
+      end
+
+      for i <- Enum.shuffle(1..n) do
+        assert :error == Microlsm.read(name, i)
       end
 
       :ok
     end
 
-    for i <- Enum.shuffle(1..n) do
-      assert :error == Microlsm.read(name, -i)
-      assert {:ok, "value_#{i}"} == Microlsm.read(name, i)
-    end
-
-    for i <- Enum.shuffle(1..n) do
-      assert :ok = Microlsm.write(name, i, "other_value_#{i}")
-    end
-
-    for i <- Enum.shuffle(1..n) do
-      assert {:ok, "other_value_#{i}"} == Microlsm.read(name, i)
-    end
-
-    for i <- Enum.shuffle(1..n) do
-      assert :ok = Microlsm.delete(name, i)
-    end
-
-    for i <- Enum.shuffle(1..n) do
-      assert :error == Microlsm.read(name, i)
-    end
+    :ok
   end
 
   test "Sets and reads in parallel, then recovers", %{name: name, data_dir: data_dir} do

@@ -1,10 +1,14 @@
 defmodule Microlsm.Disktable do
   @moduledoc false
-  import :erlang, only: [binary_to_term: 1, element: 2, term_to_binary: 1]
+  import :erlang, only: [binary_to_term: 1, element: 2, iolist_size: 1, term_to_iovec: 1]
 
   @keyread_size 4 * 1024
 
   @header_read_size 4 * 1024
+
+  @keysize_size 64
+
+  @valuesize_size 64
 
   alias Microlsm.BloomFilter
 
@@ -185,7 +189,7 @@ defmodule Microlsm.Disktable do
 
   defp list_block(block) do
     case block do
-      <<keysize::64, encoded_key::binary-size(keysize), valuesize::64,
+      <<keysize::@keysize_size, encoded_key::binary-size(keysize), valuesize::@valuesize_size,
         encoded_value::binary-size(valuesize), rest::binary>> ->
         [{binary_to_term(encoded_key), encoded_value} | list_block(rest)]
 
@@ -197,26 +201,26 @@ defmodule Microlsm.Disktable do
   defp read_kv(fd, offset, read_size) do
     case :prim_file.pread(fd, offset, read_size) do
       {:ok,
-       <<keysize::64, encoded_key::binary-size(keysize), valuesize::64,
+       <<keysize::@keysize_size, encoded_key::binary-size(keysize), valuesize::@valuesize_size,
          encoded_value::binary-size(valuesize), _::binary>>} ->
         {binary_to_term(encoded_key), encoded_value}
 
-      {:ok, <<keysize::64, encoded_key::binary-size(keysize), valuesize::64, _::binary>>} ->
+      {:ok, <<keysize::@keysize_size, encoded_key::binary-size(keysize), valuesize::@valuesize_size, _::binary>>} ->
         {:ok, <<encoded_value::binary-size(valuesize)>>} =
           :prim_file.pread(fd, offset + 8 + keysize + 8, valuesize)
 
         {binary_to_term(encoded_key), encoded_value}
 
-      {:ok, <<keysize::64, _::binary>>} ->
+      {:ok, <<keysize::@keysize_size, _::binary>>} ->
         read_size = keysize + 16 + read_size
 
         case :prim_file.pread(fd, offset, read_size) do
           {:ok,
-           <<keysize::64, encoded_key::binary-size(keysize), valuesize::64,
+           <<keysize::@keysize_size, encoded_key::binary-size(keysize), valuesize::@valuesize_size,
              encoded_value::binary-size(valuesize), _::binary>>} ->
             {binary_to_term(encoded_key), encoded_value}
 
-          {:ok, <<keysize::64, encoded_key::binary-size(keysize), valuesize::64, _::binary>>} ->
+          {:ok, <<keysize::@keysize_size, encoded_key::binary-size(keysize), valuesize::@valuesize_size, _::binary>>} ->
             {:ok, <<encoded_value::binary-size(valuesize)>>} =
               :prim_file.pread(fd, offset + 8 + keysize + 8, valuesize)
 
@@ -231,15 +235,11 @@ defmodule Microlsm.Disktable do
     nth = max(div(length, block_count), 10)
     offset = write_header(fd, List.duplicate(0, block_count * 2), 0)
 
-    # IO.inspect length, label: :length
-    # IO.inspect block_count, label: :block_count
-    # IO.inspect nth, label: :nth
-
     {offset, last_key, last_encoded_value, key_to_blocks, len, bloom_filter} =
       stream
       |> Stream.chunk_every(nth)
       |> Enum.reduce(
-        {offset, nil, nil, [], 0, BloomFilter.new(10 * length, 6)},
+        {offset, nil, <<>>, [], 0, BloomFilter.new(10 * length, 6)},
         fn block_batch, {offset, _last_key, _last_encoded_value, key_to_blocks, len, bloom_filter} ->
           len = len + length(block_batch)
           {first_key, _} = hd(block_batch)
@@ -252,8 +252,8 @@ defmodule Microlsm.Disktable do
         end
       )
 
-    last_encoded_key = term_to_binary(last_key)
-    last_pair_size = byte_size(last_encoded_key) + byte_size(last_encoded_value) + 16
+    last_encoded_key = term_to_iovec(last_key)
+    last_pair_size = iolist_size(last_encoded_key) + iolist_size(last_encoded_value) + 16
     last_block = {last_key, offset - last_pair_size}
 
     key_to_blocks =
@@ -273,21 +273,21 @@ defmodule Microlsm.Disktable do
 
   defp encode_block([{key, encoded_value}], bloom_filter, acc, block_size) do
     bloom_filter = BloomFilter.add(bloom_filter, key)
-    encoded_key = term_to_binary(key)
-    key_size = byte_size(encoded_key)
-    value_size = byte_size(encoded_value)
+    encoded_key = term_to_iovec(key)
+    key_size = iolist_size(encoded_key)
+    value_size = iolist_size(encoded_value)
     block_size = block_size + key_size + value_size + 16
-    entry = [<<key_size::64>>, encoded_key, <<value_size::64>>, encoded_value]
+    entry = [<<key_size::@keysize_size>>, encoded_key, <<value_size::@valuesize_size>>, encoded_value]
     {:lists.reverse([entry | acc]), block_size, bloom_filter, key, encoded_value}
   end
 
   defp encode_block([{key, encoded_value} | pairs], bloom_filter, acc, block_size) do
     bloom_filter = BloomFilter.add(bloom_filter, key)
-    encoded_key = term_to_binary(key)
-    key_size = byte_size(encoded_key)
-    value_size = byte_size(encoded_value)
+    encoded_key = term_to_iovec(key)
+    key_size = iolist_size(encoded_key)
+    value_size = iolist_size(encoded_value)
     block_size = block_size + key_size + value_size + 16
-    entry = [<<key_size::64>>, encoded_key, <<value_size::64>>, encoded_value]
+    entry = [<<key_size::@keysize_size>>, encoded_key, <<value_size::@valuesize_size>>, encoded_value]
     encode_block(pairs, bloom_filter, [entry | acc], block_size)
   end
 
@@ -332,6 +332,25 @@ defmodule Microlsm.Disktable do
 
       {_, {right_key, _}} when key > right_key ->
         {:error, :too_big}
+    end
+  end
+
+  def check_bounds(index, key) do
+    case {element(1, index), element(tuple_size(index), index)} do
+      {{left_key, _}, {right_key, _}} when key > left_key and key < right_key ->
+        :in
+
+      {{^key, block_offset}, {_right_key, _}} ->
+        {:exact, block_offset}
+
+      {{_left_key, _}, {^key, block_offset}} ->
+        {:exact, block_offset}
+
+      {{left_key, _}, _} when key < left_key ->
+        :lower
+
+      {_, {right_key, _}} when key > right_key ->
+        :higher
     end
   end
 
@@ -385,11 +404,22 @@ defmodule Microlsm.Disktable do
 
   def find_in_chunk(chunk, key) do
     case chunk do
-      <<keysize::64, encoded_key::binary-size(keysize), valuesize::64,
-        encoded_value::binary-size(valuesize), rest::binary>> ->
+      <<
+        keysize::@keysize_size,
+        encoded_key::binary-size(keysize),
+        valuesize::@valuesize_size,
+        encoded_value::binary-size(valuesize),
+        rest::binary
+      >> ->
         case binary_to_term(encoded_key) do
-          ^key -> {:ok, binary_to_term(encoded_value)}
-          _ -> find_in_chunk(rest, key)
+          ^key ->
+            {:ok, binary_to_term(encoded_value)}
+
+          higher when higher > key ->
+            {:error, :not_found_in_chunk_early}
+
+          _ ->
+            find_in_chunk(rest, key)
         end
 
       <<>> ->
