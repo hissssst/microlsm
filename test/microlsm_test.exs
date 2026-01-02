@@ -67,7 +67,7 @@ defmodule MicrolsmTest do
     assert :error = Microlsm.read(name, "key")
   end
 
-  @tag timeout: :infinity
+  @tag timeout: :infinity #, skip: true
   test "Writes, rewrites and deletes many times", %{name: name, data_dir: data_dir} do
     Microlsm.start_link(
       name: name,

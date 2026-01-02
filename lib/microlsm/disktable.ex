@@ -15,13 +15,14 @@ defmodule Microlsm.Disktable do
   ## Reading and streaming
 
   def total_length(fd) do
-    {length, _block_offsets} = read_header(fd, @header_read_size)
+    {length, _block_offsets_offset} = read_header(fd, @header_read_size)
     length
   end
 
   def stream(fd) do
     fn acc, fun ->
-      {_length, block_offsets} = read_header(fd, @header_read_size)
+      {_length, block_offsets_offset} = read_header(fd, @header_read_size)
+      {_block_count, block_offsets} = read_footer(fd, block_offsets_offset, @header_read_size)
       do_stream(block_offsets, fd, acc, fun)
     end
   end
@@ -233,7 +234,7 @@ defmodule Microlsm.Disktable do
 
   def write_stream(stream, fd, length, block_count) do
     nth = max(div(length, block_count), 10)
-    offset = write_header(fd, List.duplicate(0, block_count * 2), 0)
+    offset = write_header(fd, 0, length)
 
     {offset, last_key, last_encoded_value, key_to_blocks, len, bloom_filter} =
       stream
@@ -265,7 +266,73 @@ defmodule Microlsm.Disktable do
 
     index = index(key_to_blocks)
     block_offsets = Enum.map(key_to_blocks, fn {_, offset} -> offset end)
-    write_header(fd, block_offsets, len)
+    write_header(fd, offset, len)
+    write_footer(fd, offset, block_offsets)
+    :prim_file.datasync(fd)
+    bloom_filter = BloomFilter.finalize(bloom_filter)
+    {index, bloom_filter}
+  end
+
+  def write_stream2(stream, fd, length, block_size_threshold) do
+    offset = write_header(fd, 0, length)
+
+    {block, block_size, offset, first_key, last_key, key_to_blocks, len, bloom_filter} =
+      Enum.reduce(
+        stream,
+        {[], 0, offset, nil, nil, [], 0, BloomFilter.new(10 * length, 6)},
+        fn {key, encoded_value}, {block, block_size, offset, first_key, _last_key, key_to_blocks, len, bloom_filter} ->
+          len = len + 1
+
+          bloom_filter = BloomFilter.add(bloom_filter, key)
+
+          encoded_key = term_to_iovec(key)
+          key_size = iolist_size(encoded_key)
+          value_size = iolist_size(encoded_value)
+          entry = [<<key_size::@keysize_size>>, encoded_key, <<value_size::@valuesize_size>>, encoded_value]
+          entry_size = key_size + value_size + unquote(div(@keysize_size + @valuesize_size, 8))
+
+          if block_size + entry_size > block_size_threshold do
+            encoded_block = :lists.reverse(block)
+            :prim_file.pwrite(fd, offset, encoded_block)
+            key_to_blocks = [{first_key, offset} | key_to_blocks]
+
+            {[entry], entry_size, offset + block_size, key, key, key_to_blocks, len, bloom_filter}
+          else
+            first_key =
+              case block do
+                [] -> key
+                _ -> first_key
+              end
+
+            {[entry | block], block_size + entry_size, offset, first_key, key, key_to_blocks, len, bloom_filter}
+          end
+        end
+      )
+
+    [[_, _, _, last_encoded_value] | _] = block
+    encoded_block = :lists.reverse(block)
+    :prim_file.pwrite(fd, offset, encoded_block)
+    key_to_blocks = [{first_key, offset} | key_to_blocks]
+    offset = offset + block_size
+
+    key_to_blocks =
+      case block do
+        [_] ->
+          key_to_blocks
+
+        _ ->
+          last_encoded_key = term_to_iovec(last_key)
+          last_pair_size = iolist_size(last_encoded_key) + iolist_size(last_encoded_value) + unquote(div(@keysize_size + @valuesize_size, 8))
+          last_block = {last_key, offset - last_pair_size}
+
+          [last_block | key_to_blocks]
+      end
+      |> :lists.reverse()
+
+    index = index(key_to_blocks)
+    block_offsets = Enum.map(key_to_blocks, fn {_, offset} -> offset end)
+    write_header(fd, offset, len)
+    write_footer(fd, offset, block_offsets)
     :prim_file.datasync(fd)
     bloom_filter = BloomFilter.finalize(bloom_filter)
     {index, bloom_filter}
@@ -383,8 +450,8 @@ defmodule Microlsm.Disktable do
     end
   end
 
-  def find_value(fd, index, key, read_size \\ @keyread_size) do
-    case find_block(index, key) do
+  def find_value(fd, find_block_result, key, read_size \\ @keyread_size) do
+    case find_block_result do
       {:exact, offset} ->
         {_key, encoded_value} = read_kv(fd, offset, read_size)
         {:ok, binary_to_term(encoded_value)}
@@ -429,11 +496,17 @@ defmodule Microlsm.Disktable do
 
   ## Header
 
-  defp write_header(fd, block_offsets, len) do
-    block_count = length(block_offsets)
-    header = [<<len::64, block_count::64>> | encode_offsets(block_offsets)]
+  defp write_header(fd, block_offsets_offset, len) do
+    header = <<len::64, block_offsets_offset::64>>
     :ok = :prim_file.pwrite(fd, 0, header)
-    block_count * 8 + 16
+    24
+  end
+
+  defp write_footer(fd, block_offsets_offset, block_offsets) do
+    block_count = length(block_offsets)
+    footer = [<<block_count::64>> | encode_offsets(block_offsets)]
+    :ok = :prim_file.pwrite(fd, block_offsets_offset, footer)
+    block_offsets_offset + block_count * 8 + 8
   end
 
   defp encode_offsets([offset]) do
@@ -445,17 +518,21 @@ defmodule Microlsm.Disktable do
   end
 
   defp read_header(fd, readsize) do
-    {:ok, <<len::64, block_count::64, rest::binary>>} = :prim_file.pread(fd, 0, readsize)
+    {:ok, <<len::64, block_offsets_offset::64, _rest::binary>>} = :prim_file.pread(fd, 0, readsize)
+    {len, block_offsets_offset}
+  end
 
+  defp read_footer(fd, block_offsets_offset, readsize) do
+    {:ok, <<block_count::64, rest::binary>>} = :prim_file.pread(fd, block_offsets_offset, readsize)
     block_offsets =
       if byte_size(rest) < 8 * block_count do
-        {:ok, block_offsets} = :prim_file.pread(fd, 16, 8 * block_count)
+        {:ok, block_offsets} = :prim_file.pread(fd, block_offsets_offset + 8, 8 * block_count)
         block_offsets
       else
         rest
       end
 
-    {len, parse_array(block_offsets, block_count)}
+    {block_count, parse_array(block_offsets, block_count)}
   end
 
   defp parse_array(_binary, 0) do

@@ -6,6 +6,7 @@ defmodule Microlsm do
   use GenServer
 
   alias Microlsm.BloomFilter
+  alias Microlsm.DescriptorPool
   alias Microlsm.Disktable
   alias Microlsm.Memtable
   alias Microlsm.Wal
@@ -17,7 +18,8 @@ defmodule Microlsm do
     generation: nil,
     filename: nil,
     bloom_filter: nil,
-    index: nil
+    index: nil,
+    descriptor_pool_state: nil
   )
 
   @memtable_read_ahead 1_000
@@ -25,6 +27,8 @@ defmodule Microlsm do
   @call_timeout 5_000
 
   @batch_timeout 0
+
+  @descritor_pool_size 1
 
   @type key :: any()
 
@@ -43,28 +47,8 @@ defmodule Microlsm do
           {:delete, key()}
           | {:write, key(), value()}
 
-  debug? = false
-
-  if debug? do
-    @debug_queue_size 30
-    defmacrop dlog(msg) do
-      quote do: do_dlog(unquote(msg))
-    end
-
-    defp do_dlog(msg) do
-      queue =
-        with nil <- Process.get(:__debug_queue) do
-          :queue.from_list List.duplicate(nil, @debug_queue_size)
-        end
-
-      queue = :queue.drop(queue)
-      msg = {:erlang.system_time(:millisecond), msg}
-      queue = :queue.in(msg, queue)
-      Process.put(:__debug_queue, queue)
-    end
-  else
-    defmacrop dlog(_), do: nil
-  end
+  import Microlsm.Debug
+  require Microlsm.Stats
 
   ## Public API
 
@@ -113,7 +97,7 @@ defmodule Microlsm do
     # end
     # def do_read(name, key) do
 
-    {atomics_ref, mt1, mt2, it1, it2} =
+    {atomics_ref, mt1, mt2, it1, it2, descriptor_pool} =
       with nil <- :persistent_term.get({__MODULE__, name}) do
         raise ArgumentError, "No such table #{name}"
       end
@@ -129,6 +113,7 @@ defmodule Microlsm do
         :error <- Memtable.read(memtable, key),
         :error <- Memtable.read(shadow_memtable, key)
       ) do
+        Microlsm.Stats.bump(name, :memtable_miss)
         indices_table =
           case :atomics.get(atomics_ref, 2) do
             0 -> it1
@@ -136,7 +121,11 @@ defmodule Microlsm do
           end
 
         indices = :ets.match_object(indices_table, :_)
-        disktable_read(indices, key)
+        wrap_dlog do: disktable_read(indices, key, descriptor_pool, name)
+      else
+        result ->
+          Microlsm.Stats.bump(name, :memtable_hit)
+          result
       end
 
     case result do
@@ -145,32 +134,46 @@ defmodule Microlsm do
     end
   end
 
-  defp disktable_read([], _key), do: :error
+  defp disktable_read([], _key, _descriptor_pool, name) do
+    Microlsm.Stats.bump(name, :complete_miss)
+    :error
+  end
 
-  defp disktable_read([disktable | rest], key) do
-    disktable(bloom_filter: bloom_filter, index: index, filename: filename) = disktable
+  defp disktable_read([disktable | rest], key, descriptor_pool, name) do
+    disktable(
+      bloom_filter: bloom_filter,
+      index: index,
+      descriptor_pool_state: descriptor_pool_state
+    ) = disktable
 
     case Disktable.check_bounds(index, key) do
       x when x == :in or :erlang.element(1, x) == :exact ->
+        Microlsm.Stats.bump(name, :bounds_hit)
         case BloomFilter.check(bloom_filter, key) do
           :no ->
-            disktable_read(rest, key)
+            Microlsm.Stats.bump(name, :bloom_filter_miss)
+            disktable_read(rest, key, descriptor_pool, name)
 
           :maybe ->
-            {:ok, fd} = :prim_file.open(filename, [:read])
+            Microlsm.Stats.bump(name, :bloom_filter_hit)
+            result = Disktable.find_block(index, key)
+            DescriptorPool.checkout(descriptor_pool, descriptor_pool_state, fn fd ->
+              Disktable.find_value(fd, result, key)
+            end)
+            |> case do
+              {:ok, value} ->
+                Microlsm.Stats.bump(name, :disktable_hit)
+                {:ok, value}
 
-            try do
-              Disktable.find_value(fd, index, key)
-            else
-              {:ok, value} -> {:ok, value}
-              {:error, _} -> disktable_read(rest, key)
-            after
-              :prim_file.close(fd)
+              {:error, _} ->
+                Microlsm.Stats.bump(name, :disktable_miss)
+                disktable_read(rest, key, descriptor_pool, name)
             end
         end
 
       _ ->
-        disktable_read(rest, key)
+        Microlsm.Stats.bump(name, :bounds_miss)
+        disktable_read(rest, key, descriptor_pool, name)
     end
   end
 
@@ -239,7 +242,7 @@ defmodule Microlsm do
   end
 
   defp prepare_stream_read(name) do
-    {memtable, shadow_memtable, indices_table} = get_memtable_and_indices_table(name)
+    {memtable, shadow_memtable, indices_table, _descriptor_pool} = get_memtable_and_indices_table(name)
     indices = :ets.match_object(indices_table, :_)
     index_fds =
       Enum.map(indices, fn disktable(index: index, filename: filename) ->
@@ -253,7 +256,7 @@ defmodule Microlsm do
   ## Debug functions
 
   def location(name, key) do
-    {memtable, shadow_memtable, indices_table} = get_memtable_and_indices_table(name)
+    {memtable, shadow_memtable, indices_table, _descriptor_pool} = get_memtable_and_indices_table(name)
     indices = :ets.match_object(indices_table, :_)
 
     case Memtable.read(memtable, key) do
@@ -289,21 +292,14 @@ defmodule Microlsm do
   end
 
   def debug(name) do
-    {_, _, indices_table} = get_memtable_and_indices_table(name)
+    {_, _, indices_table, _descriptor_pool} = get_memtable_and_indices_table(name)
     indices = :ets.match_object(indices_table, :_)
     state = :sys.get_state(name)
     state = Map.put(state, :indices, indices)
-    unquote(
-      if debug? do
-        quote do
-          {_, dict} = Process.info(Process.whereis(var!(name)), :dictionary)
-          q = :queue.to_list Keyword.get(dict, :__debug_queue, {[], []})
-          Map.put(var!(state), :dlog, q)
-        end
-      else
-        quote do: var!(state)
-      end
-    )
+
+    {_, dict} = Process.info(Process.whereis(name), :dictionary)
+    q = :queue.to_list Keyword.get(dict, :__debug_queue, {[], []})
+    Map.put(state, :dlog, q)
   end
 
   ## GenServer
@@ -313,6 +309,10 @@ defmodule Microlsm do
     data_dir = Path.expand(Keyword.fetch!(opts, :data_dir))
     check_or_write_lock(data_dir)
     disktable_dir = Path.join(data_dir, "disktables")
+
+    if opts[:stats] do
+      Microlsm.Stats.init(name)
+    end
 
     wal_dir = Path.join(data_dir, "wal")
     File.mkdir_p!(wal_dir)
@@ -325,6 +325,7 @@ defmodule Microlsm do
       end
 
     {wal_fd, shadow_wal_fd, wal_swap_flag_fd} = restore_wals(memtable, shadow_memtable, wal_dir)
+    descriptor_pool = DescriptorPool.new()
 
     data_dir
     |> Path.join("disktables")
@@ -337,7 +338,17 @@ defmodule Microlsm do
       {:ok, fd} = :prim_file.open(filename, [:read])
       {length, index} = Disktable.load(fd)
       bloom_filter = build_bloom_filter(fd, index, length)
-      entry = disktable(generation: generation, bloom_filter: bloom_filter, index: index, filename: filename)
+      descriptor_pool_state = DescriptorPool.add(descriptor_pool, filename, @descritor_pool_size)
+
+      entry =
+        disktable(
+          generation: generation,
+          bloom_filter: bloom_filter,
+          index: index,
+          filename: filename,
+          descriptor_pool_state: descriptor_pool_state
+        )
+
       :ets.insert(indices_table, entry)
     end)
 
@@ -359,7 +370,7 @@ defmodule Microlsm do
     }
 
     atomics_ref = :atomics.new(2, signed: false)
-    :persistent_term.put({__MODULE__, name}, {atomics_ref, memtable, shadow_memtable, indices_table, shadow_indices_table})
+    :persistent_term.put({__MODULE__, name}, {atomics_ref, memtable, shadow_memtable, indices_table, shadow_indices_table, descriptor_pool})
     {:ok, state, {:continue, :dump}}
   end
 
@@ -478,7 +489,7 @@ defmodule Microlsm do
       threshold: threshold,
       merge_ref: merge_ref
     } = state
-    {memtable, _, _} = get_memtable_and_indices_table(name)
+    {memtable, _, _, _} = get_memtable_and_indices_table(name)
 
     batch = :lists.reverse(batch)
     Wal.push_batch(wal_fd, batch)
@@ -511,8 +522,8 @@ defmodule Microlsm do
   defp start_dump(state) do
     %{block_count: block_count, data_dir: data_dir, name: name} = state
 
-    {memtable, _shadow_memtable, indices_table} = get_memtable_and_indices_table(name)
-    merge_ref = spawn_dumper(indices_table, memtable, block_count, data_dir, name)
+    {memtable, _shadow_memtable, indices_table, descriptor_pool} = get_memtable_and_indices_table(name)
+    merge_ref = spawn_dumper(indices_table, memtable, block_count, data_dir, name, descriptor_pool)
 
     swap_memtables(name)
     state = swap_wals(state)
@@ -520,7 +531,7 @@ defmodule Microlsm do
     %{state | merge_ref: merge_ref}
   end
 
-  defp spawn_dumper(indices_table, memtable, block_count, data_dir, name) do
+  defp spawn_dumper(indices_table, memtable, block_count, data_dir, name, descriptor_pool) do
     owner = self()
     merge_ref = make_ref()
 
@@ -542,7 +553,8 @@ defmodule Microlsm do
           [],
           vencoded_memtable_stream,
           block_count,
-          Path.join(data_dir, "disktables")
+          Path.join(data_dir, "disktables"),
+          descriptor_pool
         )
 
       Memtable.clear(memtable)
@@ -553,8 +565,9 @@ defmodule Microlsm do
 
       swap_index_tables(name)
 
-      for {fd, filename} <- to_delete do
+      for {fd, filename, descriptor_pool_state} <- to_delete do
         :prim_file.close(fd)
+        DescriptorPool.remove(descriptor_pool, descriptor_pool_state)
         :prim_file.delete(filename)
       end
 
@@ -571,20 +584,22 @@ defmodule Microlsm do
   end
 
   defp merge(
-         [disktable(generation: generation, filename: filename) | indices],
+         [disktable(generation: generation) = disktable | indices],
          length,
          generation,
          to_delete,
          stream,
          block_count,
-         disktables_dir
+         disktables_dir,
+         descriptor_pool
        ) do
+    disktable(descriptor_pool_state: descriptor_pool_state, filename: filename) = disktable
     {:ok, fd} = :prim_file.open(filename, [:read])
     rstream = Disktable.stream(fd)
     rlength = Disktable.total_length(fd)
     stream = Microlsm.Stream.merge_streams(stream, rstream)
 
-    to_delete = [{fd, Path.join(disktables_dir, Integer.to_string(generation))} | to_delete]
+    to_delete = [{fd, Path.join(disktables_dir, Integer.to_string(generation)), descriptor_pool_state} | to_delete]
 
     merge(
       indices,
@@ -593,13 +608,14 @@ defmodule Microlsm do
       to_delete,
       stream,
       block_count,
-      disktables_dir
+      disktables_dir,
+      descriptor_pool
     )
   end
 
   @encoded_deletes [term_to_binary({}), term_to_iovec({})]
 
-  defp merge(indices, length, generation, to_delete, stream, block_count, disktables_dir) do
+  defp merge(indices, length, generation, to_delete, stream, _block_count, disktables_dir, descriptor_pool) do
     filename = Path.join(disktables_dir, Integer.to_string(generation))
     {:ok, fd} = :prim_file.open(filename, [:write, :read])
 
@@ -607,16 +623,26 @@ defmodule Microlsm do
       case indices do
         [] ->
           # We just drop tombstones in the oldest generation
-          stream
-          |> Stream.reject(&match?({_, value} when value in @encoded_deletes, &1))
-          |> Disktable.write_stream(fd, length, block_count)
+          Stream.reject(stream, &match?({_, value} when value in @encoded_deletes, &1))
 
         _ ->
-          Disktable.write_stream(stream, fd, length, block_count)
+          stream
       end
+      # |> Disktable.write_stream(fd, length, block_count)
+      |> Disktable.write_stream2(fd, length, 4 * 1024)
 
     :prim_file.close(fd)
-    disktable = disktable(generation: generation, bloom_filter: bloom_filter, index: index, filename: filename)
+    descriptor_pool_state = DescriptorPool.add(descriptor_pool, filename, @descritor_pool_size)
+
+    disktable =
+      disktable(
+        generation: generation,
+        bloom_filter: bloom_filter,
+        index: index,
+        filename: filename,
+        descriptor_pool_state: descriptor_pool_state
+      )
+
     {[disktable | indices], to_delete}
   end
 
@@ -690,25 +716,25 @@ defmodule Microlsm do
   end
 
   defp do_swap_tables(name, index) do
-    {atomics_ref, _mt1, _mt2, _it1, _it2} = :persistent_term.get({__MODULE__, name})
+    {atomics_ref, _mt1, _mt2, _it1, _it2, _dp} = :persistent_term.get({__MODULE__, name})
     old = :atomics.get(atomics_ref, index)
     new = 1 - old
     :ok = :atomics.compare_exchange(atomics_ref, index, old, new)
   end
 
   defp get_memtable_and_indices_table(name) do
-    {atomics_ref, mt1, mt2, it1, it2} = :persistent_term.get({__MODULE__, name})
+    {atomics_ref, mt1, mt2, it1, it2, dp} = :persistent_term.get({__MODULE__, name})
 
     case {:atomics.get(atomics_ref, 1), :atomics.get(atomics_ref, 2)} do
-      {0, 0} -> {mt1, mt2, it1}
-      {1, 0} -> {mt2, mt1, it1}
-      {0, 1} -> {mt1, mt2, it2}
-      {1, 1} -> {mt2, mt1, it2}
+      {0, 0} -> {mt1, mt2, it1, dp}
+      {1, 0} -> {mt2, mt1, it1, dp}
+      {0, 1} -> {mt1, mt2, it2, dp}
+      {1, 1} -> {mt2, mt1, it2, dp}
     end
   end
 
   defp get_shadow_indices_table(name) do
-    {atomics_ref, _mt1, _mt2, it1, it2} = :persistent_term.get({__MODULE__, name})
+    {atomics_ref, _mt1, _mt2, it1, it2, _dp} = :persistent_term.get({__MODULE__, name})
 
     case :atomics.get(atomics_ref, 2) do
       1 -> it1

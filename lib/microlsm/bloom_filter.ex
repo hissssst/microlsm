@@ -3,6 +3,9 @@ defmodule Microlsm.BloomFilter do
 
   import Bitwise, only: [|||: 2, <<<: 2, &&&: 2, >>>: 2]
 
+  @bitsize_threshold 4194239
+  # Because 1 <<< 4194240 raises an error
+
   ## Stream creation
 
   def new(bitsize, k) do
@@ -11,7 +14,7 @@ defmodule Microlsm.BloomFilter do
   end
 
   def add({bitsize, k, mask}, key) do
-    mask = add_to_mask(k, mask, key, bitsize)
+    mask = add_to_mask_short(k, mask, key, bitsize)
     {bitsize, k, mask}
   end
 
@@ -26,7 +29,7 @@ defmodule Microlsm.BloomFilter do
 
     mask =
       Enum.reduce(enumerable, 0, fn key, mask ->
-        add_to_mask(k, mask, key, bitsize)
+        add_to_mask_short(k, mask, key, bitsize)
       end)
 
     {bitsize, k, <<mask::little-unsigned-integer-size(bitsize)>>}
@@ -61,19 +64,19 @@ defmodule Microlsm.BloomFilter do
 
   ## Helpers
 
-  defp add_to_mask(0, mask, key, bitsize) do
+  defp add_to_mask_short(0, mask, key, bitsize) do
     index = :erlang.phash2({0, key}, bitsize)
     mask ||| 1 <<< index
   end
 
-  defp add_to_mask(k, mask, key, bitsize) do
+  defp add_to_mask_short(k, mask, key, bitsize) do
     index = :erlang.phash2({k, key}, bitsize)
     mask = mask ||| 1 <<< index
-    add_to_mask(k - 1, mask, key, bitsize)
+    add_to_mask_short(k - 1, mask, key, bitsize)
   end
 
   defp align_bitsize(bitsize) do
-    align_bytesize(bitsize) <<< 3
+    min(align_bytesize(bitsize) <<< 3, @bitsize_threshold)
   end
 
   defp align_bytesize(0) do
