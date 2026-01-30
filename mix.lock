@@ -3,4 +3,6 @@
   "eflambe": {:hex, :eflambe, "0.3.2", "0813eae9370091ad1214c94f7c79e315532dc27ee42d4f86b2210e2a807fd041", [:rebar3], [{:meck, "0.9.2", [hex: :meck, repo: "hexpm", optional: false]}], "hexpm", "2b4fd71c56d3e950105aae7747eb12158a0975ca754d891d6389f5186d7efb58"},
   "erlex": {:hex, :erlex, "0.2.7", "810e8725f96ab74d17aac676e748627a07bc87eb950d2b83acd29dc047a30595", [:mix], [], "hexpm", "3ed95f79d1a844c3f6bf0cea61e0d5612a42ce56da9c03f01df538685365efb0"},
   "meck": {:hex, :meck, "0.9.2", "85ccbab053f1db86c7ca240e9fc718170ee5bda03810a6292b5306bf31bae5f5", [:rebar3], [], "hexpm", "81344f561357dc40a8344afa53767c32669153355b626ea9fcbc8da6b3045826"},
+  "odcounter": {:hex, :odcounter, "2.0.0", "8df25631d7714892df0e3075df51601824dec816bd0bd22a39ac981c6748337e", [:mix], [], "hexpm", "864a2a71154761c1617947fa78bd279f0ce1671b791ee67bf344ecb40d97d3e7"},
+  "stream_data": {:hex, :stream_data, "1.2.0", "58dd3f9e88afe27dc38bef26fce0c84a9e7a96772b2925c7b32cd2435697a52b", [:mix], [], "hexpm", "eb5c546ee3466920314643edf68943a5b14b32d1da9fe01698dc92b73f89a9ed"},
 }

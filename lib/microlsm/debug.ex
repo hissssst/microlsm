@@ -36,8 +36,14 @@ defmodule Microlsm.Debug do
       queue = :queue.in(msg, queue)
       Process.put(:__debug_queue, queue)
     end
+
+    def get_dlog(pid) do
+      {_, dict} = Process.info(pid, :dictionary)
+      :queue.to_list Keyword.get(dict, :__debug_queue, {[], []})
+    end
   else
     def debug?, do: false
+    def get_dlog(_), do: []
     defmacro dlog(_), do: nil
     defmacro wrap_dlog(do: code), do: code
   end

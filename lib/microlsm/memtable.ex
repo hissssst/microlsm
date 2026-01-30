@@ -39,6 +39,10 @@ defmodule Microlsm.Memtable do
     :ets.insert(memtable, pairs)
   end
 
+  def write(memtable, key, value) do
+    :ets.insert(memtable, {key, value})
+  end
+
   defp do_stream(memtable, selector, read_ahead) do
     Stream.resource(
       fn -> :ets.select(memtable, selector, read_ahead) end,

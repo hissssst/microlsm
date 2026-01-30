@@ -67,6 +67,21 @@ defmodule MicrolsmTest do
     assert :error = Microlsm.read(name, "key")
   end
 
+  test "Recovers on a single key rewrite", %{name: name, data_dir: data_dir} do
+    {:ok, pid} = Microlsm.start_link(name: name, data_dir: data_dir)
+    assert :ok = Microlsm.write(name, "key", "value1")
+    assert {:ok, "value1"} = Microlsm.read(name, "key")
+    assert :ok = Microlsm.write(name, "key", "value2")
+    assert {:ok, "value2"} = Microlsm.read(name, "key")
+
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+    assert nil == Process.info(pid)
+
+    assert {:ok, _pid} = Microlsm.start_link(name: name, data_dir: data_dir)
+    assert {:ok, "value2"} = Microlsm.read(name, "key")
+  end
+
   @tag timeout: :infinity #, skip: true
   test "Writes, rewrites and deletes many times", %{name: name, data_dir: data_dir} do
     Microlsm.start_link(
@@ -110,7 +125,7 @@ defmodule MicrolsmTest do
       :ok
     end
 
-    :ok
+    Microlsm.Stats.print(name)
   end
 
   test "Sets and reads in parallel, then recovers", %{name: name, data_dir: data_dir} do

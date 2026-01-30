@@ -8,22 +8,30 @@ defmodule Microlsm.BloomFilter do
 
   ## Stream creation
 
+  @opaque builder :: {pos_integer(), non_neg_integer(), non_neg_integer()}
+
+  @opaque t :: {pos_integer(), pos_integer(), binary()}
+
+  @spec new(bitsize :: pos_integer(), k :: pos_integer()) :: builder()
   def new(bitsize, k) do
     bitsize = align_bitsize(bitsize)
     {bitsize, k - 1, 0}
   end
 
+  @spec add(builder(), term()) :: builder()
   def add({bitsize, k, mask}, key) do
     mask = add_to_mask_short(k, mask, key, bitsize)
     {bitsize, k, mask}
   end
 
+  @spec finalize(builder()) :: t()
   def finalize({bitsize, k, mask}) do
     {bitsize, k, <<mask::little-unsigned-integer-size(bitsize)>>}
   end
 
   ## Another stream
 
+  @spec build(Enumerable.t(), pos_integer(), pos_integer()) :: t()
   def build(enumerable, bitsize, k) when k >= 2 do
     bitsize = align_bitsize(bitsize)
 
@@ -37,8 +45,8 @@ defmodule Microlsm.BloomFilter do
 
   ## Checking
 
-  def check(filter, key) do
-    {bitsize, k, mask} = filter
+  @spec check(t(), term()) :: :maybe | :no
+  def check({bitsize, k, mask}, key) do
     do_check(k - 1, bitsize, mask, key)
   end
 

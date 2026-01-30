@@ -1,7 +1,12 @@
 defmodule Microlsm.Wal do
-  import :erlang, only: [term_to_binary: 1, binary_to_term: 1]
+  @moduledoc false
+
+  import :erlang, only: [term_to_iovec: 1, binary_to_term: 1, iolist_size: 1]
+  import Bitwise, only: [<<<: 2]
+  alias Microlsm.SizeException
 
   # 10MB
+  # @batch_read_size 10 * 1024 * 1024
   @batch_read_size 10 * 1024 * 1024
 
   # Literally infinite size of an operation
@@ -14,6 +19,7 @@ defmodule Microlsm.Wal do
   end
 
   def truncate(fd) do
+    {:ok, 0} = :prim_file.position(fd, 0)
     :ok = :prim_file.truncate(fd)
     :ok = :prim_file.sync(fd)
   end
@@ -35,16 +41,20 @@ defmodule Microlsm.Wal do
     )
   end
 
-  defp decode_ops(<<size::@opsize_size, op::binary-size(size), tail::binary>>, acc, total_size, total_count) do
-    decode_ops(tail, [binary_to_term(op) | acc], total_size + size + 8, total_count + 1)
-  end
-
   defp decode_ops(binary, acc, total_size, total_count) do
-    {:lists.reverse(acc), binary, total_size + byte_size(binary), total_count}
+    case binary do
+      <<size::@opsize_size, op::binary-size(size), tail::binary>> ->
+        decode_ops(tail, [binary_to_term(op) | acc], total_size + size + 8, total_count + 1)
+
+      binary ->
+        {:lists.reverse(acc), binary, total_size + byte_size(binary), total_count}
+    end
   end
 
   defp encode_op(op) do
-    encoded = term_to_binary(op)
-    <<byte_size(encoded)::@opsize_size, encoded::binary>>
+    encoded = term_to_iovec(op)
+    size = iolist_size(encoded)
+    SizeException.check!(size, 1 <<< @opsize_size, op)
+    [<<size::@opsize_size>> | encoded]
   end
 end
