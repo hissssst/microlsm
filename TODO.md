@@ -7,6 +7,8 @@
 
 [ ] README
 
+[ ] Docs
+
 [ ] Improve descriptor pool cleanup process to load the system less
 
 [ ] Make a search index of disktable ranges.
@@ -15,6 +17,15 @@
     is not much slower
 
 [ ] Improve restart to not reset the persistent_term
+    Hard to do, because state hanging around may cause problems with concurrent reads
+
+[ ] Fallback for big key and big value
+
+[ ] Implement generation backtracking based on table size, not length
+
+[ ] Backtracking may produce funny results with allow_overflow. Investigate
+
+[ ] Implement overlow with storing disktables in gen0, without merging
 
 ## WONT DO
 
@@ -31,6 +42,7 @@
 
 ## DONE
 
+[x] Backtracking generation for overwrite-only scenarios
 [x] Configuration of parameters at start_link (including spawn_opt)
 [x] Cleanup and drop table
 [x] Compile-time configuration of stats

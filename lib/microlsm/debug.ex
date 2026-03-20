@@ -1,6 +1,7 @@
 defmodule Microlsm.Debug do
+  # Zero-abstraction debugging
   @moduledoc false
-  debug? = true
+  debug? = false
 
   if debug? do
     @debug_queue_size 30

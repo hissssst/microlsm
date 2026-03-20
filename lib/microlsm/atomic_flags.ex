@@ -10,7 +10,7 @@ defmodule Microlsm.AtomicFlags do
 
   indexed_schema = Enum.with_index(@schema, 1)
 
-  @opaque t() :: :atomics.atomics_ref()
+  @type t() :: :atomics.atomics_ref()
 
   @type key() :: :memtables | :gentables | :reading
 
@@ -22,6 +22,30 @@ defmodule Microlsm.AtomicFlags do
   @spec new() :: t()
   def new do
     :atomics.new(unquote(length(@schema)), signed: false)
+  end
+
+  @spec reset(t()) :: :ok
+  def reset(atomics_ref) do
+    for i <- 1..unquote(length(@schema)) do
+      :atomics.put(atomics_ref, i, 0)
+    end
+    :ok
+  end
+
+  defmacro switch(atomics_ref, key, [do: do_block, else: else_block]) do
+    index =
+      if is_atom(key) do
+        indexof(key)
+      else
+        quote do: indexof(unquote(key))
+      end
+
+    quote do
+      case :atomics.get(unquote(atomics_ref), unquote(index)) do
+        0 -> unquote(do_block)
+        1 -> unquote(else_block)
+      end
+    end
   end
 
   @spec select(t(), key(), value0, value1) :: value0 | value1

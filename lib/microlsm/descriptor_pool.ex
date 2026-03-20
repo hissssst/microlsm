@@ -24,6 +24,13 @@ defmodule Microlsm.DescriptorPool do
     {table, sup}
   end
 
+  @spec delete(pool()) :: :ok
+  def delete({table, sup}) do
+    DynamicSupervisor.stop(sup)
+    true = :ets.delete(table)
+    :ok
+  end
+
   @spec clean(pool()) :: :ok
   def clean(pool) do
     {table, sup} = pool
@@ -78,7 +85,7 @@ defmodule Microlsm.DescriptorPool do
     def checkout(pool, state, func, timeout \\ 5_000) do
       {table, sup} = pool
       {filename_ref, atomics_ref, count, filename} = state
-      {index, cell} = checkout_cell(sup, table, filename_ref, filename, atomics_ref, count)
+      {_index, cell} = checkout_cell(sup, table, filename_ref, filename, atomics_ref, count)
       dlog({:checked_out, filename_ref, index, filename, cell})
       monitor_ref = Process.monitor(cell, alias: :reply_demonitor)
       send(cell, {:execute, monitor_ref, func, self()})
@@ -87,7 +94,9 @@ defmodule Microlsm.DescriptorPool do
           result
 
         {^monitor_ref, kind, error, stacktrace} ->
-          :erlang.raise(kind, error, stacktrace)
+          {:current_stacktrace, current_stacktrace} = Process.info(self(), :current_stacktrace)
+          [_process_info_call | current_stacktrace] = current_stacktrace
+          :erlang.raise(kind, error, stacktrace ++ current_stacktrace)
 
         {:DOWN, ^monitor_ref, :process, ^cell, reason} ->
           raise "Cell exited with #{inspect(reason)}"
@@ -161,6 +170,7 @@ defmodule Microlsm.DescriptorPool do
 
     cell =
       spawn_link(fn ->
+        Process.flag(:priority, :high)
         {:ok, fd} = :prim_file.open(filename, [:read])
         ms = [{{{filename_ref, index}, :_, :_}, [], [{{{{filename_ref, index}}, as, self()}}]}]
         1 = :ets.select_replace(table, ms)

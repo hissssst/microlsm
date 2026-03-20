@@ -21,7 +21,9 @@ defmodule Microlsm.Gentable do
     filename: nil,
     generation: nil,
     id: nil,
-    index: nil
+    index: nil,
+    length: nil,
+    max_block_size: nil
 
   @type disktable :: {
     :disktable,
@@ -30,7 +32,9 @@ defmodule Microlsm.Gentable do
     filename :: Path.t(),
     generation :: generation_number(),
     id :: term(),
-    index :: Disktable.index()
+    index :: Disktable.index(),
+    length :: pos_integer(),
+    max_block_size :: pos_integer()
   }
 
   @spec new() :: table()
@@ -51,6 +55,12 @@ defmodule Microlsm.Gentable do
       end)
 
     :ets.insert(table, generations)
+    :ok
+  end
+
+  @spec delete(table()) :: :ok
+  def delete(table) do
+    true = :ets.delete(table)
     :ok
   end
 

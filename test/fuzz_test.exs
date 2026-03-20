@@ -3,8 +3,6 @@ defmodule Microlsm.FuzzTest do
 
   @moduletag fuzz: true, timeout: :infinity
 
-  import ExUnit.CaptureIO
-
   setup do
     {:ok, Microlsm.Test.Support.setup_datadir()}
   end
@@ -46,10 +44,10 @@ defmodule Microlsm.FuzzTest do
   end
 
   @tag skip: true
-  test "Fuzz", %{name: name, data_dir: data_dir} do
+  test "Fuzz multi key", %{name: name, data_dir: data_dir} do
     test_length = 128 * 1024
     threshold = 1024
-    kill_every = 100
+    kill_every = 250
 
     {:ok, _pid} =
       Microlsm.start_link(
@@ -92,19 +90,9 @@ defmodule Microlsm.FuzzTest do
 
     import StreamData, only: []
 
-    IO.inspect data_dir
-
     ops =
       stream
       |> Stream.take(test_length)
-      |> Stream.with_index()
-      |> Stream.map(fn {entry, index} ->
-        if rem(index, 1000) == 0 do
-          IO.puts "\n\nHERE #{index}\n"
-        end
-
-        entry
-      end)
       |> Enum.reduce([], fn entry, acc ->
         case entry do
           [op | args] ->
@@ -115,10 +103,8 @@ defmodule Microlsm.FuzzTest do
             pid = Process.whereis(name)
             Process.unlink(pid)
 
-            capture_io fn ->
-              Process.exit(pid, :kill)
-              await_killed(pid)
-            end
+            Process.exit(pid, :kill)
+            await_killed(pid)
 
             {:ok, _} =
               Microlsm.start_link(
@@ -127,7 +113,7 @@ defmodule Microlsm.FuzzTest do
                 threshold: threshold
               )
 
-            # check(name, [:kill | acc])
+            check(name, [:kill | acc])
         end
 
         [entry | acc]
@@ -237,5 +223,90 @@ defmodule Microlsm.FuzzTest do
 
   defp filter_batch([], _key) do
     []
+  end
+
+  # @tag skip: true
+  test "Fuzz single key", %{name: name, data_dir: data_dir} do
+    test_length = 128 * 1024
+    threshold = 1024
+    kill_every = 512
+
+    {:ok, _pid} =
+      Microlsm.start_link(
+        name: name,
+        data_dir: data_dir,
+        threshold: threshold,
+        wal_length_threshold: 10
+      )
+
+    key = :x
+    first_value = :y
+    ReferenceStore.new(name)
+    ReferenceStore.write(name, key, first_value)
+    Microlsm.write(name, key, first_value)
+
+    import StreamData
+
+    x =
+      one_of [
+        integer(),
+        bitstring(max_length: 1024),
+        string(:ascii, max_length: 1024)
+      ]
+
+    stream =
+      frequency [
+        {kill_every, x},
+        {kill_every, :all},
+        {2, :kill}
+      ]
+
+    import StreamData, only: []
+
+    IO.inspect data_dir
+
+    {_, ops} =
+      stream
+      |> Stream.take(test_length)
+      |> Enum.reduce({first_value, []}, fn entry, {old_value, acc} ->
+        case entry do
+          :kill ->
+            pid = Process.whereis(name)
+            Process.unlink(pid)
+
+            Process.exit(pid, :kill)
+            await_killed(pid)
+
+            {:ok, _} =
+              Microlsm.start_link(
+                name: name,
+                data_dir: data_dir,
+                threshold: threshold
+              )
+
+            acc = [:kill | acc]
+            check(name, acc)
+            {old_value, acc}
+
+          :all ->
+            assert Enum.to_list(Microlsm.all(name)) == ReferenceStore.all(name)
+            {old_value, acc}
+
+          value ->
+            assert {:ok, ^old_value} = ReferenceStore.read(name, key)
+            assert {:ok, ^old_value} = Microlsm.read(name, key)
+
+            ReferenceStore.write(name, key, value)
+            Microlsm.write(name, key, value)
+
+            assert {:ok, ^value} = Microlsm.read(name, key)
+            assert {:ok, ^value} = ReferenceStore.read(name, key)
+
+            {value, [[:write, name, key, value] | acc]}
+        end
+      end)
+
+    check(name, ops)
+    Microlsm.Stats.print(name)
   end
 end

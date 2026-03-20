@@ -12,19 +12,56 @@ defmodule Microlsm.Wal do
   # Literally infinite size of an operation
   @opsize_size 64
 
-  def push_batch(fd, ops) do
+  @type t :: {fd :: tuple(), length :: non_neg_integer()}
+
+  @spec open(Path.t(), ({pos_integer(), [term()]} -> any())) :: t()
+  def open(full_wal_path, hook) do
+    {:ok, wal_fd} = :prim_file.open(full_wal_path, [:read, :append, :write])
+
+    total_length =
+      wal_fd
+      |> fd_stream()
+      |> Enum.reduce(0, fn {batch_length, _batch} = entry, total_length ->
+        hook.(entry)
+        total_length + batch_length
+      end)
+
+    {wal_fd, total_length}
+  end
+
+  @spec push_batch(t(), [term()], non_neg_integer()) :: t()
+  def push_batch(wal, ops, ops_length) do
+    {fd, length} = wal
+
     encoded = for op <- ops, do: encode_op(op)
     :ok = :prim_file.write(fd, encoded)
     :ok = :prim_file.datasync(fd)
+
+    {fd, length + ops_length}
   end
 
-  def truncate(fd) do
+  @spec length(t()) :: non_neg_integer()
+  def length(wal) do
+    {_fd, length} = wal
+    length
+  end
+
+  @spec truncate(t()) :: t()
+  def truncate(wal) do
+    {fd, _} = wal
     {:ok, 0} = :prim_file.position(fd, 0)
     :ok = :prim_file.truncate(fd)
     :ok = :prim_file.sync(fd)
+    {fd, 0}
   end
 
-  def stream(fd) do
+  @spec stream(t()) :: Enumerable.t()
+  def stream(wal) do
+    {wal_fd, _} = wal
+    fd_stream(wal_fd)
+  end
+
+  defp fd_stream(fd) do
     Stream.resource(
       fn -> {0, <<>>} end,
       fn {offset, head} ->

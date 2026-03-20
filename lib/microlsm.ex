@@ -26,77 +26,226 @@ defmodule Microlsm do
     gentable2: nil,
     descriptor_pool: nil,
     # Config
-    block_size_threshold: nil,
     memtable_read_ahead: nil
 
+  require AtomicFlags
   require ODCounter
 
   @call_timeout 5_000
 
+  @typedoc """
+  A key. Any Elixir term can be used as a key. Please keep in mind, that runtime-specific terms
+  like `t:pid/0` and `t:reference/0` are encoded with current node ID and will represent the different
+  node when the runtime restarts.
+  """
   @type key :: any()
 
+  @typedoc """
+  A value. Any Elixir term can be used as a value. Please keep in mind, that runtime-specific terms
+  like `t:pid/0` and `t:reference/0` are encoded with current node ID and will represent the different
+  node when the runtime restarts.
+  """
   @type value :: any()
 
+  @typedoc """
+  Name of the table. It must be an atom. Table server is registered under this name.
+  """
   @type t :: atom()
 
+  @typedoc """
+  Options passed in the `start_link/2`
+
+  * `name` (`t:name/0`) Required. — Name of the table.
+
+  * `data_dir` (`t:Path.t/0`) Required. — A directory which will be used to store the data of the table.
+
+  * `descriptor_pool_size` (`t:pos_integer/0`) — A size of pool of open file descriptors for a single file. Defaults to `2`.
+
+  * `threshold` (bytes) — A maximum amount of data to be kept in memory table. Exceeding this threshold triggers a compaction. Defaults to 16 megabytes.
+
+  * `wal_length_threshold` (length number) — A maximum length of WAL log to be held on disk. Exceeding this threshold triggers a compaction. Defaults to 10k.
+
+  * `block_size_threshold` (bytes) — A maximum size of a block in a disk table. Defaults to 4 kylobytes.
+
+  * `max_batch_length` (`t:pos_integer/0`) — A maximum size of a batch of entries before performing dump to WAL. Defaults to `10000`.
+
+  * `memtable_read_ahead` (`t:pos_integer/0`) — An amount of entries to read from memtable in one call. Defaults to `1000`.
+  """
   @type start_option ::
           {:name, t()}
+          | {:allow_overflow, boolean()}
           | {:data_dir, Path.t()}
           | {:descriptor_pool_size, pos_integer()}
           | {:threshold, bytes :: pos_integer()}
+          | {:wal_length_threshold, length :: pos_integer()}
           | {:block_size_threshold, bytes :: pos_integer()}
           | {:max_batch_length, pos_integer()}
           | {:memtable_read_ahead, pos_integer()}
 
+  @typedoc """
+  An operation passed in a list to `batch/3` call.
+  """
   @type batch_operation ::
           {:delete, key()}
           | {:write, key(), value()}
 
+  @typedoc """
+  Options passed in the functions which call the Microlsm server.
+
+  * `timeout` (`t:timeout/0`) — Timeout for the call. Defaults to `5000`
+  """
   @type call_timeout_option :: {:timeout, timeout()}
 
   import Microlsm.Debug
 
+  ## Safety checks
+
+  defmacrop assert_alive!(name) do
+    quote do
+      name = unquote(name)
+      with nil <- Process.whereis(name) do
+        raise ArgumentError, "Table #{name} does not exist"
+      end
+    end
+  end
+
   ## Public API
 
+  @doc """
+  Starts a key-value table. Table is not available for reads until this function returns.
+
+  See `t:start_option/0` for documentation of the options.
+  """
   @spec start_link([start_option()]) :: GenServer.on_start()
   def start_link(opts) do
     name = Keyword.fetch!(opts, :name)
-    GenServer.start_link(Microlsm, opts, name: name)
+    case Process.whereis(name) do
+      nil ->
+        GenServer.start_link(Microlsm, opts)
+
+      pid ->
+        {:error, {:already_started, pid}}
+    end
   end
 
+  @doc """
+  Cleans all the existing data in the table. Table is
+  ready for use right after this call.
+
+  ## Example
+
+      iex> Microlsm.write(:my_table, [:user, 1, :name], "Username")
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      {:ok, "Username"}
+      iex> Microlsm.clean(:my_table)
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      :error
+  """
   @spec clean(t(), [call_timeout_option()]) :: :ok
   def clean(name, opts \\ []) do
     GenServer.call(name, :clean, call_timeout(opts))
   end
 
+  @doc """
+  Writes a value to the given key. If the key already exists, value is overwritten.
+  Returns when write is persisted.
+
+  ## Example
+
+      iex> Microlsm.write(:my_table, [:user, 1, :name], "Username")
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      {:ok, "Username"}
+  """
   @spec write(t(), key(), value(), [call_timeout_option()]) :: :ok
   def write(name, key, value, opts \\ []) do
     GenServer.call(name, {:write, key, {value}}, call_timeout(opts))
   end
 
+  @doc """
+  Writes a value to the given key. If the key already exists, value is overwritten.
+  Returns when write is visible, but not yet persisted.
+
+  ## Example
+
+      iex> Microlsm.write_nosync(:my_table, [:user, 1, :name], "Username")
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      {:ok, "Username"}
+  """
   @spec write_nosync(t(), key(), value(), [call_timeout_option()]) :: :ok
   def write_nosync(name, key, value, opts \\ []) do
     GenServer.call(name, {:write_nosync, key, {value}}, call_timeout(opts))
   end
 
+  @doc """
+  Writes a value to the given key. If the key already exists, value is overwritten.
+  Returns immediately, when write is not even visible.
+  """
   @spec async_write(t(), key(), value()) :: :ok
   def async_write(name, key, value) do
     GenServer.cast(name, {:async_write, key, {value}})
     :ok
   end
 
+  @doc """
+  Deletes a key. Succeeds even when key doesn't exist.
+  Returns when delete is persisted.
+
+  ## Example
+
+      iex> Microlsm.write(:my_table, [:user, 1, :name], "Username")
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      {:ok, "Username"}
+      iex> Microlsm.delete(:my_table, [:user, 1, :name])
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      :error
+  """
   @spec delete(t(), key(), [call_timeout_option()]) :: :ok
   def delete(name, key, opts \\ []) do
     GenServer.call(name, {:write, key, {}}, call_timeout(opts))
   end
 
+  @doc """
+  Deletes a key. Succeeds even when key doesn't exist.
+  Returns when delete is visible, but not yet persisted.
+
+  ## Example
+
+      iex> Microlsm.write(:my_table, [:user, 1, :name], "Username")
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      {:ok, "Username"}
+      iex> Microlsm.delete_nosync(:my_table, [:user, 1, :name])
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      :error
+  """
+  @spec delete_nosync(t(), key(), [call_timeout_option()]) :: :ok
+  def delete_nosync(name, key, opts \\ []) do
+    GenServer.call(name, {:write_nosync, key, {}}, call_timeout(opts))
+  end
+
+  @doc """
+  Deletes a key. Succeeds even when key doesn't exist.
+  Returns immediately, when delete is not even visible.
+  """
   @spec async_delete(t(), key()) :: :ok
   def async_delete(name, key) do
     GenServer.cast(name, {:async_write, key, {}})
     :ok
   end
 
-  @spec batch(t(), [batch_operation()], [call_timeout_option()]) :: :ok
+  @doc """
+  Atomically performs a batch of operations.
+  Returns when all changes are persisted.
+
+  ## Example
+
+      iex> Microlsm.batch(:my_table, [
+      ...>   {:write, :key1, :value1},
+      ...>   {:write, :key2, :value2}
+      ...> ])
+      iex> Microlsm.read(:my_table, :key1)
+      {:ok, :value1}
+  """
+  @spec batch(t(), Enumerable.t(batch_operation()), [call_timeout_option()]) :: :ok
   def batch(name, batch, opts \\ []) do
     batch =
       Enum.map(batch, fn
@@ -112,79 +261,83 @@ defmodule Microlsm do
     Keyword.get(opts, :timeout, @call_timeout)
   end
 
+  @doc """
+  Reads a value for the given key. Returns `:error` when value is not found
+
+  ## Example
+
+      iex> Microlsm.write(:my_table, [:user, 1, :name], "Username")
+      iex> Microlsm.read(:my_table, [:user, 1, :name])
+      {:ok, "Username"}
+  """
   @spec read(t(), key()) :: {:ok, value()} | :error
   def read(name, key) do
     #   :eflambe.apply({Microlsm, :do_read, [name, key]}, output_directory: ~c"flamegraphs")
     # end
     # def do_read(name, key) do
-    maybe_raise_when_no_table(name)
+    assert_alive!(name)
 
     global_state(
       atomics_ref: atomics_ref,
-      block_size_threshold: block_size_threshold,
       memtable1: mt1,
       memtable2: mt2,
       gentable1: gt1,
       gentable2: gt2,
       descriptor_pool: descriptor_pool
-    ) =
-      with nil <- :persistent_term.get({Microlsm, name}) do
-        raise ArgumentError, "No such table #{name}"
-      end
+    ) = :persistent_term.get({Microlsm, name})
 
-    case AtomicFlags.select(atomics_ref, :reading, :enabled, :disabled) do
-      :enabled ->
-        {memtable, shadow_memtable} = AtomicFlags.order(atomics_ref, :memtables, mt1, mt2)
+    AtomicFlags.switch(atomics_ref, :reading) do
+      {memtable, shadow_memtable} = AtomicFlags.order(atomics_ref, :memtables, mt1, mt2)
 
-        result =
-          with(
-            :error <- Memtable.read(memtable, key),
-            :error <- Memtable.read(shadow_memtable, key)
-          ) do
-            ODCounter.add(Microlsm, name, :memtable_miss)
-            gentable = AtomicFlags.select(atomics_ref, :gentables, gt1, gt2)
-            generations = Gentable.to_list(gentable)
-            disktable_read(generations, key, descriptor_pool, name, block_size_threshold)
-          else
-            result ->
-              ODCounter.add(Microlsm, name, :memtable_hit)
-              result
-          end
-
-        case result do
-          {:ok, {value}} -> {:ok, value}
-          _ -> :error
+      result =
+        with(
+          :error <- Memtable.read(memtable, key),
+          :error <- Memtable.read(shadow_memtable, key)
+        ) do
+          ODCounter.add(Microlsm, name, :memtable_miss)
+          gentable = AtomicFlags.select(atomics_ref, :gentables, gt1, gt2)
+          generations = Gentable.to_list(gentable)
+          disktable_read(generations, key, descriptor_pool, name)
+        else
+          result ->
+            ODCounter.add(Microlsm, name, :memtable_hit)
+            result
         end
 
-      :disabled ->
-        :error
+      case result do
+        {:ok, {value}} -> {:ok, value}
+        _ -> :error
+      end
+    else
+      :error
     end
   end
 
-  defp disktable_read([], _key, _descriptor_pool, name, _block_size) do
+  defp disktable_read([], _key, _descriptor_pool, name) do
     ODCounter.add(Microlsm, name, :complete_miss)
     :error
   end
 
-  defp disktable_read([{_generation, disktables} | rest], key, descriptor_pool, name, block_size) do
+  defp disktable_read([{_generation, disktables} | rest], key, descriptor_pool, name) do
     case Gentable.search_disktable_in_generation(disktables, key) do
       disktable(
+        max_block_size: max_block_size,
         bloom_filter: bloom_filter,
-        index: index,
-        descriptor_pool_state: descriptor_pool_state
+        descriptor_pool_state: descriptor_pool_state,
+        index: index
       ) ->
         ODCounter.add(Microlsm, name, :generation_hit)
         case BloomFilter.check(bloom_filter, key) do
           :no ->
             ODCounter.add(Microlsm, name, :bloom_filter_miss)
-            disktable_read(rest, key, descriptor_pool, name, block_size)
+            disktable_read(rest, key, descriptor_pool, name)
 
           :maybe ->
             ODCounter.add(Microlsm, name, :bloom_filter_hit)
             result = Disktable.find_block(index, key)
 
             DescriptorPool.checkout(descriptor_pool, descriptor_pool_state, fn fd ->
-              Disktable.find_value(fd, result, key, block_size)
+              Disktable.find_value(fd, result, key, max_block_size)
             end)
             |> case do
               {:ok, value} ->
@@ -193,70 +346,138 @@ defmodule Microlsm do
 
               {:error, _} ->
                 ODCounter.add(Microlsm, name, :disktable_miss)
-                disktable_read(rest, key, descriptor_pool, name, block_size)
+                disktable_read(rest, key, descriptor_pool, name)
             end
         end
 
       :not_found ->
         ODCounter.add(Microlsm, name, :generation_miss)
-        disktable_read(rest, key, descriptor_pool, name, block_size)
+        disktable_read(rest, key, descriptor_pool, name)
     end
   end
 
+  @doc """
+  Returns an ordered lazily evaluated Enumerable of all current key-value pairs.
+  Returned stream is consistent and returns all data present in the Microlsm key
+  range **at the moment of the call**. Be aware that it instantiates all memtable
+  entries as soon as it is called.
 
+  Returned stream MUST be traversed or closed. Otherwise zombie file descriptors will be left open.
+
+  ## Example
+
+      iex> Microlsm.batch(:my_table, [
+      ...>   {:write, :key1, :value1},
+      ...>   {:write, :key2, :value2}
+      ...> ])
+      iex> Enum.to_list Microlsm.all(:my_table)
+      [{:key1, :value1}, {:key2, :value2}]
+  """
   @spec all(t()) :: Enumerable.t({key(), value()})
   def all(name) do
-    maybe_raise_when_no_table(name)
-    {memtable, shadow_memtable, gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
-    generations = Gentable.to_list(gentable)
+    assert_alive!(name)
+    global_state(atomics_ref: atomics_ref) = :persistent_term.get({Microlsm, name})
 
-    memtable_stream = Memtable.stream(memtable, memtable_read_ahead)
-    shadow_memtable_stream = Memtable.stream(shadow_memtable, memtable_read_ahead)
+    AtomicFlags.switch(atomics_ref, :reading) do
+      {memtable, shadow_memtable, gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
+      generations = Gentable.to_list(gentable)
 
-    all_memtables_stream = Microlsm.Stream.merge_streams(memtable_stream, shadow_memtable_stream)
+      memtable_stream = Memtable.stream(memtable, memtable_read_ahead)
+      shadow_memtable_stream = Memtable.stream(shadow_memtable, memtable_read_ahead)
 
-    # Otherwise we would get funny inconsistencies
-    all_memtables_list = Enum.to_list(all_memtables_stream)
+      all_memtables_stream = Microlsm.Stream.merge_streams(memtable_stream, shadow_memtable_stream)
 
-    {fds, stream} =
-      Enum.map_reduce(generations, all_memtables_list, fn disktable(filename: filename, index: index), stream ->
-        {:ok, fd} = :prim_file.open(filename, [:read])
-        disk_stream = Disktable.stream(fd, index)
-        stream = Microlsm.Stream.merge_streams(stream, disk_stream)
-        {fd, stream}
-      end)
+      # To avoid funny inconsistencies
+      all_memtables_list = Enum.to_list(all_memtables_stream)
 
-    finalize_read_stream(stream, fds)
+      {fds, stream} =
+        Enum.reduce(generations, {[], all_memtables_list}, fn {_, {disktable(filename: filename, index: index)}}, {fds, stream} ->
+          # IO.inspect filename, label: :filename
+          # IO.inspect generations, label: :generations
+          {:ok, fd} =
+            with {:error, :enoent} <- :prim_file.open(filename, [:read]) do
+              for fd <- fds, do: :prim_file.close(fd)
+              throw :retry
+            end
+
+          disk_stream = Disktable.stream(fd, index)
+          stream = Microlsm.Stream.merge_streams(stream, disk_stream)
+          {[fd | fds], stream}
+        end)
+
+      finalize_read_stream(stream, fds)
+    else
+      []
+    end
+  catch
+    :retry ->
+      ODCounter.add(Microlsm, name, :mread_retries)
+      all(name)
   end
 
+  @doc """
+  Returns an ordered lazily evaluated Enumerable of all key-value pairs present in the
+  specified key range, including left and right boundaries. Returned stream is consistent
+  and returns all data present in the Microlsm key range **at the moment of the call**.
+  Be aware that it instantiates all in-range memtable entries as soon as it is called.
+
+  Returned stream MUST be traversed or closed. Otherwise zombie file descriptors will be left open.
+
+  ## Example
+
+      iex> Microlsm.batch(:my_table, [
+      ...>   {:write, :key1, :value1},
+      ...>   {:write, :key2, :value2},
+      ...>   {:write, :key3, :value3},
+      ...>   {:write, :key4, :value4},
+      ...>   {:write, :key5, :value5}
+      ...> ])
+      iex> Enum.to_list Microlsm.range_read(:my_table, :key2, :key4)
+      [{:key2, :value2}, {:key3, :value3}, {:key4, :value4}]
+  """
   @spec range_read(t(), key(), key()) :: Enumerable.t({key(), value()})
   def range_read(name, left_key, right_key) when left_key <= right_key do
-    maybe_raise_when_no_table(name)
-    {memtable, shadow_memtable, gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
-    generations = Gentable.to_list(gentable)
-    memtable_stream = Memtable.range_read(memtable, left_key, right_key, memtable_read_ahead)
-    shadow_memtable_stream = Memtable.range_read(shadow_memtable, left_key, right_key, memtable_read_ahead)
+    assert_alive!(name)
+    global_state(atomics_ref: atomics_ref) = :persistent_term.get({Microlsm, name})
 
-    all_memtables_stream = Microlsm.Stream.merge_streams(memtable_stream, shadow_memtable_stream)
+    AtomicFlags.switch(atomics_ref, :reading) do
+      {memtable, shadow_memtable, gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
+      generations = Gentable.to_list(gentable)
+      memtable_stream = Memtable.range_read(memtable, left_key, right_key, memtable_read_ahead)
+      shadow_memtable_stream = Memtable.range_read(shadow_memtable, left_key, right_key, memtable_read_ahead)
 
-    # Otherwise we would get funny inconsistencies
-    all_memtables_list = Enum.to_list(all_memtables_stream)
+      all_memtables_stream = Microlsm.Stream.merge_streams(memtable_stream, shadow_memtable_stream)
 
-    {fds, stream} =
-      Enum.flat_map_reduce(generations, all_memtables_list, fn disktable(filename: filename, index: index), stream ->
-        case Disktable.range_offsets(index, left_key, right_key) do
-          [] ->
-            {[], stream}
+      # To avoid funny inconsistencies
+      all_memtables_list = Enum.to_list(all_memtables_stream)
 
-          offsets ->
-            {:ok, fd} = :prim_file.open(filename, [:read])
-            disk_stream = Disktable.range_stream(fd, left_key, right_key, offsets)
-            stream = Microlsm.Stream.merge_streams(stream, disk_stream)
-            {[fd], stream}
-        end
-      end)
+      {fds, stream} =
+        Enum.reduce(generations, {[], all_memtables_list}, fn {_, {disktable(filename: filename, index: index)}}, {fds, stream} ->
+          case Disktable.range_offsets(index, left_key, right_key) do
+            [] ->
+              {fds, stream}
 
-    finalize_read_stream(stream, fds)
+            offsets ->
+              {:ok, fd} =
+                with {:error, :enoent} <- :prim_file.open(filename, [:read]) do
+                  for fd <- fds, do: :prim_file.close(fd)
+                  throw :retry
+                end
+
+              disk_stream = Disktable.range_stream(fd, left_key, right_key, offsets)
+              stream = Microlsm.Stream.merge_streams(stream, disk_stream)
+              {[fd | fds], stream}
+          end
+        end)
+
+      finalize_read_stream(stream, fds)
+    else
+      []
+    end
+  catch
+    :retry ->
+      ODCounter.add(Microlsm, name, :mread_retries)
+      all(name)
   end
 
   defp finalize_read_stream(stream, fds) do
@@ -281,6 +502,7 @@ defmodule Microlsm do
 
   ## Debug functions
 
+  @doc false
   def location(name, key) do
     {memtable, shadow_memtable, gentable, _descriptor_pool, _memtable_read_ahead} = get_memtable_and_gentable(name)
     generations = Gentable.to_list(gentable)
@@ -305,13 +527,20 @@ defmodule Microlsm do
   defp disktable_location([{_generation, disktables} | rest], key) do
     disktable = Gentable.search_disktable_in_generation(disktables, key)
 
-    disktable(generation: generation, bloom_filter: bloom_filter, index: index, filename: filename) = disktable
+    disktable(
+      max_block_size: max_block_size,
+      bloom_filter: bloom_filter,
+      filename: filename,
+      generation: generation,
+      index: index
+    ) = disktable
+
     {:ok, fd} = :prim_file.open(filename, [:read])
 
     bloom_check = BloomFilter.check(bloom_filter, key)
     try do
       block = Disktable.find_block(index, key)
-      Disktable.find_value(fd, block, key)
+      Disktable.find_value(fd, block, key, max_block_size)
     else
       {:ok, value} -> {:disktable, generation, bloom_check, value, filename}
       {:error, _} -> disktable_location(rest, key)
@@ -320,6 +549,7 @@ defmodule Microlsm do
     end
   end
 
+  @doc false
   def debug(name) do
     pid = Process.whereis(name)
     {_, _, gentable, _descriptor_pool, _memtable_read_ahead} = get_memtable_and_gentable(name)
@@ -331,10 +561,36 @@ defmodule Microlsm do
 
   ## GenServer
 
+  defp recover_global_state(name, memtable_read_ahead) do
+    global_state = create_global_state(memtable_read_ahead)
+    :persistent_term.put({Microlsm, name}, global_state)
+    global_state
+  end
+
+  defp create_global_state(memtable_read_ahead) do
+    atomics_ref = AtomicFlags.new()
+    memtable = Memtable.new()
+    shadow_memtable = Memtable.new()
+    gentable = Gentable.new()
+    shadow_gentable = Gentable.new()
+    descriptor_pool = DescriptorPool.new()
+
+    global_state(
+      atomics_ref: atomics_ref,
+      memtable1: memtable,
+      memtable2: shadow_memtable,
+      gentable1: gentable,
+      gentable2: shadow_gentable,
+      descriptor_pool: descriptor_pool,
+      memtable_read_ahead: memtable_read_ahead
+    )
+  end
+
+  @doc false
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
 
-    ODCounter.init_schema(Microlsm, runtime_size: 10, ignore_if_exists: true)
+    ODCounter.init_schema(Microlsm, runtime_size: 16, ignore_if_exists: true)
     ODCounter.new(Microlsm, name, ignore_if_exists: true)
     ODCounter.reset(Microlsm, name)
 
@@ -342,23 +598,26 @@ defmodule Microlsm do
     check_or_write_lock(data_dir)
     disktable_dir = Path.join(data_dir, "disktables")
 
+    allow_overflow = Keyword.get(opts, :allow_overflow, false)
     block_size_threshold = Keyword.get(opts, :block_size_threshold, 4 * 1024)
     memtable_read_ahead = Keyword.get(opts, :memtable_read_ahead, 1000)
     batch_timeout = Keyword.get(opts, :batch_timeout, 0)
-    threshold = Keyword.get(opts, :threshold, 1024)
-    max_batch_length = Keyword.get(opts, :max_batch_length, 10 * 1024)
-    descriptor_pool_size = Keyword.get(opts, :descriptor_pool_size, 1)
+    threshold = Keyword.get(opts, :threshold, 16 * 1024 * 1024)
+    max_batch_length = Keyword.get(opts, :max_batch_length, 10_000)
+    descriptor_pool_size = Keyword.get(opts, :descriptor_pool_size, 2)
+    wal_length_threshold = Keyword.get(opts, :wal_length_threshold, div(threshold, 32) + 10)
 
     wal_dir = Path.join(data_dir, "wal")
     File.mkdir_p!(wal_dir)
 
-    memtable = Memtable.new()
-    shadow_memtable = Memtable.new()
-    gentable = Gentable.new()
-    shadow_gentable = Gentable.new()
+    global_state(
+      memtable1: memtable,
+      memtable2: shadow_memtable,
+      gentable1: gentable,
+      descriptor_pool: descriptor_pool
+    ) = recover_global_state(name, memtable_read_ahead)
 
-    {wal_fd, shadow_wal_fd, wal_swap_flag_fd} = restore_wals(memtable, shadow_memtable, wal_dir)
-    descriptor_pool = DescriptorPool.new()
+    {wal, shadow_wal, wal_swap_flag_fd} = restore_wals(memtable, shadow_memtable, wal_dir)
 
     with :ok <- File.mkdir_p(disktable_dir) do
       dlog(:mkdir_p_disktable_dir)
@@ -371,14 +630,16 @@ defmodule Microlsm do
       name: name,
       data_dir: data_dir,
 
+      allow_overflow: allow_overflow,
       block_size_threshold: block_size_threshold,
       batch_timeout: batch_timeout,
       threshold: threshold,
       max_batch_length: max_batch_length,
       descriptor_pool_size: descriptor_pool_size,
+      wal_length_threshold: wal_length_threshold,
 
-      wal_fd: wal_fd,
-      shadow_wal_fd: shadow_wal_fd,
+      wal: wal,
+      shadow_wal: shadow_wal,
       wal_swap_flag_fd: wal_swap_flag_fd,
 
       batch_length: 0,
@@ -386,20 +647,7 @@ defmodule Microlsm do
       reply_tos: []
     }
 
-    atomics_ref = AtomicFlags.new()
-    global_state =
-      global_state(
-        atomics_ref: atomics_ref,
-        block_size_threshold: block_size_threshold,
-        memtable1: memtable,
-        memtable2: shadow_memtable,
-        gentable1: gentable,
-        gentable2: shadow_gentable,
-        descriptor_pool: descriptor_pool,
-        memtable_read_ahead: memtable_read_ahead
-      )
-
-    :persistent_term.put({Microlsm, name}, global_state)
+    Process.register(self(), name)
     {:ok, state, {:continue, :init_dump}}
   end
 
@@ -420,7 +668,7 @@ defmodule Microlsm do
             :prim_file.delete(filename)
             groups
 
-          {length, index} ->
+          {length, max_block_size, index} ->
             bloom_filter = build_bloom_filter(fd, index, length)
             descriptor_pool_state = DescriptorPool.add(descriptor_pool, filename, descriptor_pool_size)
 
@@ -431,7 +679,9 @@ defmodule Microlsm do
                 bloom_filter: bloom_filter,
                 index: index,
                 filename: filename,
-                descriptor_pool_state: descriptor_pool_state
+                descriptor_pool_state: descriptor_pool_state,
+                length: length,
+                max_block_size: max_block_size
               )
 
             case groups do
@@ -465,15 +715,27 @@ defmodule Microlsm do
 
   defp restore_wal(wal_dir, wal_filename, memtable) do
     full_wal_path = Path.expand(Path.join(wal_dir, wal_filename))
-    {:ok, wal_fd} = :prim_file.open(full_wal_path, [:read, :append, :write])
+    wal =
+      Wal.open(full_wal_path, fn {_length, batch} ->
+        Memtable.write(memtable, batch)
+      end)
 
-    wal_fd
-    |> Wal.stream()
-    |> Enum.each(fn {_length, batch} ->
-      Memtable.write(memtable, batch)
-    end)
+    wal
+  end
 
-    wal_fd
+  @doc false
+  def handle_continue(:init_dump, state) do
+    dlog(:continue_init_dump)
+    %{data_dir: data_dir, name: name, block_size_threshold: block_size_threshold, descriptor_pool_size: descriptor_pool_size} = state
+
+    {_memtable, shadow_memtable, gentable, descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
+
+    if Memtable.empty?(shadow_memtable) do
+      {:noreply, state}
+    else
+      merge_ref = spawn_merge(gentable, shadow_memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead)
+      {:noreply, %{state | merge_ref: merge_ref}}
+    end
   end
 
   def handle_continue(:dump, state) do
@@ -490,23 +752,16 @@ defmodule Microlsm do
     end
   end
 
-  def handle_continue(:init_dump, state) do
-    dlog(:continue_init_dump)
-    %{data_dir: data_dir, name: name, block_size_threshold: block_size_threshold, descriptor_pool_size: descriptor_pool_size} = state
-
-    {_memtable, shadow_memtable, gentable, descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
-
-    if Memtable.size(shadow_memtable) > 0 do
-      merge_ref = spawn_merge(gentable, shadow_memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead)
-      {:noreply, %{state | merge_ref: merge_ref}}
-    else
-      {:noreply, state}
-    end
-  end
-
+  @doc false
   def handle_call(:clean, _from, state) do
-    state = maybe_await_merge_finish(state)
-    %{name: name, wal_fd: working_wal, shadow_wal_fd: shadow_wal} = state
+    %{name: name, wal: working_wal, shadow_wal: shadow_wal} = state
+
+    state =
+      with %{merge_ref: merge_ref} when not is_nil(merge_ref) <- state do
+        ODCounter.add(Microlsm, name, :dumps_late)
+        await_merge_finish(merge_ref, state)
+      end
+
     global_state(
       atomics_ref: atomics_ref,
       memtable1: mt1,
@@ -533,6 +788,7 @@ defmodule Microlsm do
     :disabled = AtomicFlags.select(atomics_ref, :reading, :enabled, :disabled)
     AtomicFlags.swap(atomics_ref, :reading)
 
+    :erlang.garbage_collect()
     {:reply, :ok, state}
   end
 
@@ -571,6 +827,7 @@ defmodule Microlsm do
     do_handle_write(key, value, state)
   end
 
+  @doc false
   def handle_cast({:async_write, key, value}, state) do
     dlog(:continue_async_write)
     do_handle_write(key, value, state)
@@ -591,6 +848,7 @@ defmodule Microlsm do
     {:noreply, state, {:continue, :dump}}
   end
 
+  @doc false
   def handle_info({:microlsm_merge_done, ref}, %{merge_ref: ref} = state) do
     state = finish_merge(state)
     {:noreply, state, {:continue, :dump}}
@@ -619,22 +877,37 @@ defmodule Microlsm do
   defp run_batch(state) do
     %{
       name: name,
-      wal_fd: wal_fd,
+      wal: wal,
       batch: batch,
+      batch_length: batch_length,
+      allow_overflow: allow_overflow,
       reply_tos: reply_tos,
-      threshold: threshold
+      threshold: threshold,
+      wal_length_threshold: wal_length_threshold
     } = state
+
     {memtable, _, _, _, _} = get_memtable_and_gentable(name)
 
     batch = :lists.reverse(batch)
-    Wal.push_batch(wal_fd, batch)
+    wal = Wal.push_batch(wal, batch, batch_length)
     Memtable.write(memtable, batch)
 
+    state = %{state | wal: wal}
+
     state =
-      if Memtable.memory(memtable) > threshold do
-        state
-        |> maybe_await_merge_finish()
-        |> start_dump()
+      if Wal.length(wal) >= wal_length_threshold or Memtable.memory(memtable) >= threshold do
+        case state do
+          %{merge_ref: nil} ->
+            start_dump(state)
+
+          %{merge_ref: merge_ref} ->
+            ODCounter.add(Microlsm, name, :dumps_late)
+            if allow_overflow do
+              state
+            else
+              await_merge_finish(merge_ref, state)
+            end
+        end
       else
         state
       end
@@ -644,12 +917,7 @@ defmodule Microlsm do
     %{state | batch: [], reply_tos: [], batch_length: 0}
   end
 
-  defp maybe_await_merge_finish(%{merge_ref: nil} = state) do
-    state
-  end
-
-  defp maybe_await_merge_finish(%{merge_ref: merge_ref, name: name} = state) do
-    ODCounter.add(Microlsm, name, :dumps_late)
+  defp await_merge_finish(merge_ref, state) when not is_nil(merge_ref) do
     receive do
       {:microlsm_merge_done, ^merge_ref} ->
         finish_merge(state)
@@ -673,10 +941,10 @@ defmodule Microlsm do
 
     {memtable, _shadow_memtable, gentable, descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
 
-    merge_ref = spawn_merge(gentable, memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead)
-
     state = swap_wals(state)
     swap_memtables(name)
+
+    merge_ref = spawn_merge(gentable, memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead)
 
     %{state | merge_ref: merge_ref}
   end
@@ -699,7 +967,8 @@ defmodule Microlsm do
       {new_generations, to_delete} =
         merge(
           generations,
-          Memtable.size(memtable),
+          Memtable.length(memtable),
+          [],
           0,
           [],
           vencoded_memtable_stream,
@@ -709,15 +978,15 @@ defmodule Microlsm do
           descriptor_pool_size
         )
 
-      Memtable.clear(memtable)
       shadow_gentable = get_shadow_gentable(name)
-
       Gentable.clear(shadow_gentable)
       Gentable.insert(shadow_gentable, new_generations)
 
       swap_gentables(name)
+      Memtable.clear(memtable)
 
       for {fd, filename, descriptor_pool_state} <- to_delete do
+        # IO.inspect filename, label: :deleting
         :prim_file.close(fd)
         DescriptorPool.remove(descriptor_pool, descriptor_pool_state)
         :prim_file.delete(filename)
@@ -730,74 +999,104 @@ defmodule Microlsm do
   end
 
   defp finish_merge(state) do
-    %{shadow_wal_fd: wal_fd} = state
-    Wal.truncate(wal_fd)
-    %{state | merge_ref: nil}
+    %{shadow_wal: shadow_wal} = state
+    shadow_wal = Wal.truncate(shadow_wal)
+    %{state | shadow_wal: shadow_wal, merge_ref: nil}
   end
 
+  @encoded_deletes [term_to_iovec({}), term_to_binary({})]
+
   defp merge(
-         [{generation, disktables} | generations],
-         length,
+         generations,
+         total_length,
+         lengths,
          generation,
          to_delete,
          stream,
-         disktables_dir,
+         disktable_dir,
          descriptor_pool,
          block_size_threshold,
          descriptor_pool_size
        ) do
-    {disktable(descriptor_pool_state: descriptor_pool_state, filename: filename)} = disktables #FIXME
-    {:ok, fd} = :prim_file.open(filename, [:read])
-    rstream = Disktable.stream(fd)
-    rlength = Disktable.total_length(fd) # TODO optimize
-    stream = Microlsm.Stream.merge_streams(stream, rstream)
+    case generations do
+      [{^generation, disktables} | generations] ->
+        {disktable(descriptor_pool_state: descriptor_pool_state, filename: filename)} = disktables #FIXME
+        {:ok, fd} = :prim_file.open(filename, [:read])
+        {rlength, _, rstream} = Disktable.header_and_stream(fd)
+        stream = Microlsm.Stream.merge_streams(stream, rstream)
 
-    to_delete = [{fd, filename, descriptor_pool_state} | to_delete]
+        to_delete = [{fd, filename, descriptor_pool_state} | to_delete]
 
-    merge(
-      generations,
-      length + rlength,
-      generation + 1,
-      to_delete,
-      stream,
-      disktables_dir,
-      descriptor_pool,
-      block_size_threshold,
-      descriptor_pool_size
-    )
+        merge(
+          generations,
+          total_length + rlength,
+          [rlength | lengths],
+          generation + 1,
+          to_delete,
+          stream,
+          disktable_dir,
+          descriptor_pool,
+          block_size_threshold,
+          descriptor_pool_size
+        )
+
+      _ ->
+        write_full_filename = filename_for_generation(disktable_dir, generation)
+        {:ok, fd} = :prim_file.open(write_full_filename, [:write, :read])
+
+        {index, bloom_filter, max_block_size, table_length} =
+          case generations do
+            [] ->
+              # We just drop tombstones in the oldest generation
+              Stream.reject(stream, &match?({_, value} when value in @encoded_deletes, &1))
+
+            _ ->
+              stream
+          end
+          |> Disktable.write_stream(fd, total_length, block_size_threshold)
+
+        :prim_file.close(fd)
+        backtracked_generation = backtrack_generation(lengths, table_length, generation)
+
+        full_filename =
+          if backtracked_generation != generation do
+            full_filename = filename_for_generation(disktable_dir, backtracked_generation)
+            # IO.inspect {write_full_filename, full_filename}, label: :renaming
+            :ok = :prim_file.rename(write_full_filename, full_filename)
+            full_filename
+          else
+            write_full_filename
+          end
+
+        descriptor_pool_state = DescriptorPool.add(descriptor_pool, full_filename, descriptor_pool_size)
+
+        disktable =
+          disktable(
+            generation: backtracked_generation,
+            bloom_filter: bloom_filter,
+            index: index,
+            filename: full_filename,
+            descriptor_pool_state: descriptor_pool_state,
+            length: table_length,
+            max_block_size: max_block_size
+          )
+
+        {[{backtracked_generation, {disktable}} | generations], to_delete}
+    end
   end
 
-  @encoded_deletes [term_to_binary({}), term_to_iovec({})]
+  defp backtrack_generation([higher | lengths], table_length, generation) when higher >= table_length do
+    backtrack_generation(lengths, table_length, generation - 1)
+  end
 
-  defp merge(generations, length, generation, to_delete, stream, disktables_dir, descriptor_pool, block_size_threshold, descriptor_pool_size) do
-    postfix = "#{generation}_#{DateTime.to_unix DateTime.utc_now :millisecond}"
-    filename = Path.join(disktables_dir, postfix)
-    {:ok, fd} = :prim_file.open(filename, [:write, :read])
+  defp backtrack_generation(_, _, generation) do
+    generation
+  end
 
-    {index, bloom_filter} =
-      case generations do
-        [] ->
-          # We just drop tombstones in the oldest generation
-          Stream.reject(stream, &match?({_, value} when value in @encoded_deletes, &1))
-
-        _ ->
-          stream
-      end
-      |> Disktable.write_stream(fd, length, block_size_threshold)
-
-    :prim_file.close(fd)
-    descriptor_pool_state = DescriptorPool.add(descriptor_pool, filename, descriptor_pool_size)
-
-    disktable =
-      disktable(
-        generation: generation,
-        bloom_filter: bloom_filter,
-        index: index,
-        filename: filename,
-        descriptor_pool_state: descriptor_pool_state
-      )
-
-    {[{generation, {disktable}} | generations], to_delete}
+  defp filename_for_generation(disktable_dir, generation) do
+    postfix = DateTime.to_unix(DateTime.utc_now(:millisecond), :millisecond) #FIXME need proper postfix generator
+    fname = "#{generation}_#{postfix}"
+    Path.join(disktable_dir, fname)
   end
 
   defp build_bloom_filter(fd, index, length) do
@@ -811,13 +1110,7 @@ defmodule Microlsm do
     |> BloomFilter.finalize()
   end
 
-  ## Safety checks
-
-  defp maybe_raise_when_no_table(name) do
-    with nil <- Process.whereis(name) do
-      raise ArgumentError, "No such table #{name}"
-    end
-  end
+  ## Write lock
 
   defp check_or_write_lock(data_dir) do
     full_lock_path = Path.join(data_dir, "lock")
@@ -847,7 +1140,7 @@ defmodule Microlsm do
   ## Compaction swap
 
   defp swap_wals(state) do
-    %{wal_fd: working_wal, shadow_wal_fd: shadow_wal, wal_swap_flag_fd: wal_swap_flag_fd} = state
+    %{wal: working_wal, shadow_wal: shadow_wal, wal_swap_flag_fd: wal_swap_flag_fd} = state
 
     to_write =
       case :prim_file.pread(wal_swap_flag_fd, 0, 8) do
@@ -858,7 +1151,7 @@ defmodule Microlsm do
     :prim_file.pwrite(wal_swap_flag_fd, 0, to_write)
     :prim_file.sync(wal_swap_flag_fd)
 
-    %{state | wal_fd: shadow_wal, shadow_wal_fd: working_wal}
+    %{state | wal: shadow_wal, shadow_wal: working_wal}
   end
 
   defp swap_memtables(name) do

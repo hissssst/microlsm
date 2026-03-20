@@ -28,11 +28,11 @@ defmodule Microlsm.WalTest do
 
     %{data_dir: dir} = Support.setup_datadir()
     filename = Path.join(dir, "wal")
-    {:ok, fd} = :prim_file.open(filename, [:write, :read])
+    wal = Wal.open(filename, fn _ -> [] end)
 
     ops = Enum.take(stream, n)
-    Wal.push_batch(fd, ops)
-    assert ops == Enum.flat_map(Wal.stream(fd), fn {_size, ops} -> ops end)
+    Wal.push_batch(wal, ops, n)
+    assert ops == Enum.flat_map(Wal.stream(wal), fn {_size, ops} -> ops end)
   end
 
   test "Key repeats" do
@@ -40,9 +40,9 @@ defmodule Microlsm.WalTest do
 
     %{data_dir: dir} = Support.setup_datadir()
     filename = Path.join(dir, "wal")
-    {:ok, fd} = :prim_file.open(filename, [:write, :read])
+    wal = Wal.open(filename, fn _ -> [] end)
 
-    Wal.push_batch(fd, ops)
-    assert ops == Enum.flat_map(Wal.stream(fd), fn {_size, ops} -> ops end)
+    Wal.push_batch(wal, ops, length(ops))
+    assert ops == Enum.flat_map(Wal.stream(wal), fn {_size, ops} -> ops end)
   end
 end

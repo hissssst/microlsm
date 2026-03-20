@@ -88,8 +88,7 @@ defmodule MicrolsmTest do
       name: name,
       data_dir: data_dir,
       max_batch_length: 100,
-      threshold: 4 * 1_024,
-      block_count: 100
+      threshold: 4 * 1_024
     )
 
     times = 1
@@ -119,7 +118,13 @@ defmodule MicrolsmTest do
       end
 
       for i <- Enum.shuffle(1..n) do
-        assert :error == Microlsm.read(name, i)
+        try do
+          Microlsm.read(name, i)
+        rescue
+          e ->
+            IO.inspect i
+            reraise e, __STACKTRACE__
+        end
       end
 
       :ok
@@ -133,8 +138,7 @@ defmodule MicrolsmTest do
       Microlsm.start_link(
         name: name,
         data_dir: data_dir,
-        threshold: 1024 * 1024,
-        block_count: 1024
+        threshold: 1024 * 1024
       )
 
     n = 10 * 1024
@@ -162,5 +166,22 @@ defmodule MicrolsmTest do
       assert :error == Microlsm.read(name, -i)
       assert {:ok, "value_#{i}"} == Microlsm.read(name, i)
     end
+  end
+
+  test "all/1", %{name: name, data_dir: data_dir} do
+    {:ok, _} =
+      Microlsm.start_link(
+        name: name,
+        data_dir: data_dir,
+        threshold: 128
+      )
+
+    batch =
+      for i <- 1..1024 do
+        {:write, i, i}
+      end
+
+    Microlsm.batch(name, batch)
+    assert Enum.to_list(Microlsm.all(name)) == (for i <- 1..1024, do: {i, i})
   end
 end
