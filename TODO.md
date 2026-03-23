@@ -2,9 +2,6 @@
 
 [ ] Test range reads
 
-[ ] Investigate non-log2 structure of SST heirarchy
-    That means some logN
-
 [ ] README
 
 [ ] Docs
@@ -26,6 +23,9 @@
 [ ] Backtracking may produce funny results with allow_overflow. Investigate
 
 [ ] Implement overlow with storing disktables in gen0, without merging
+
+[ ] Investigate non-log2 structure of SST heirarchy
+    That means some logN
 
 ## WONT DO
 

@@ -1,10 +1,29 @@
 defmodule Microlsm.FuzzTest do
   use ExUnit.Case
+  import StreamData
 
   @moduletag fuzz: true, timeout: :infinity
 
   setup do
     {:ok, Microlsm.Test.Support.setup_datadir()}
+  end
+
+  defp x do
+    one_of [
+      integer(),
+      bitstring(max_length: 1024),
+      string(:ascii, max_length: 1024)
+    ]
+  end
+
+  defp batch(key, value) do
+    list_of(
+      one_of([
+        {:write, key, x()},
+        {:delete, key},
+      ]),
+      max_length: 16
+    )
   end
 
   defmodule ReferenceStore do
@@ -23,16 +42,24 @@ defmodule Microlsm.FuzzTest do
       :ets.tab2list(name)
     end
 
+    def range_read(name, left_key, right_key) do
+      selector = [{{:"$1", :"$2"}, [{:andalso, {:>=, :"$1", left_key}, {:"=<", :"$1", right_key}}], [{{:"$1", :"$2"}}]}]
+      :ets.select(name, selector)
+    end
+
     def write(name, key, value) do
       :ets.insert(name, {key, value})
+      :ok
     end
 
     def write_nosync(name, key, value) do
       :ets.insert(name, {key, value})
+      :ok
     end
 
     def delete(name, key) do
       :ets.delete(name, key)
+      :ok
     end
 
     def batch(name, batch) do
@@ -40,6 +67,7 @@ defmodule Microlsm.FuzzTest do
         {:write, key, value} -> write(name, key, value)
         {:delete, key} -> delete(name, key)
       end)
+      :ok
     end
   end
 
@@ -58,33 +86,14 @@ defmodule Microlsm.FuzzTest do
 
     ReferenceStore.new(name)
 
-    import StreamData
-
-    x =
-      one_of [
-        integer(),
-        bitstring(max_length: 1024),
-        string(:ascii, max_length: 1024)
-      ]
-
-    key = integer()
-
-    value = x
-
-    batch =
-      list_of(
-        one_of([
-          {:write, key, value},
-          {:delete, key},
-        ]),
-        max_length: 16
-      )
+    key = x()
+    value = x()
 
     stream =
       frequency [
         {kill_every, fixed_list([:write, name, key, value])},
         {kill_every, fixed_list([:delete, name, key])},
-        {kill_every, fixed_list([:batch, name, batch])},
+        {kill_every, fixed_list([:batch, name, batch(key, value)])},
         {3, :kill}
       ]
 
@@ -201,6 +210,14 @@ defmodule Microlsm.FuzzTest do
     end
   end
 
+  defp filter_ops([:kill | ops], key) do
+    ops = filter_ops(ops, key)
+    case ops do
+      [:kill | _] -> ops
+      ops -> [:kill | ops]
+    end
+  end
+
   defp filter_ops([_ | ops], key) do
     filter_ops(ops, key)
   end
@@ -281,6 +298,7 @@ defmodule Microlsm.FuzzTest do
               Microlsm.start_link(
                 name: name,
                 data_dir: data_dir,
+                reset_counters: false,
                 threshold: threshold
               )
 
@@ -304,6 +322,107 @@ defmodule Microlsm.FuzzTest do
 
             {value, [[:write, name, key, value] | acc]}
         end
+      end)
+
+    check(name, ops)
+    Microlsm.Stats.print(name)
+  end
+
+  test "Range reads", %{name: name, data_dir: data_dir} do
+    test_length = 128 * 1024
+    threshold = 1024
+    kill_every = 512
+
+    key = integer()
+    value = x()
+    batch = batch(key, value)
+
+    {:ok, _pid} =
+      Microlsm.start_link(
+        name: name,
+        data_dir: data_dir,
+        threshold: 1024,
+      )
+
+    ReferenceStore.new(name)
+
+    x =
+      one_of [
+        integer(),
+        bitstring(max_length: 1024),
+        string(:ascii, max_length: 1024)
+      ]
+
+    stream =
+      frequency [
+        {1 * kill_every, fixed_list([:write, name, key, value])},
+        {4, :kill},
+        {1 * kill_every, fixed_list([:delete, name, key])},
+        # {10 * kill_every, fixed_list([:batch, name, batch])},
+        {1 * kill_every, fixed_list([:range_read, name, key, key])},
+        {1 * kill_every, fixed_list([:all, name])}
+      ]
+
+    IO.inspect data_dir
+
+    ops =
+      stream
+      |> Stream.take(test_length)
+      |> Stream.map(fn
+        [:range_read, name, k1, k2] when k1 > k2 ->
+          [:range_read, name, k2, k1]
+
+        other ->
+          other
+      end)
+      |> Enum.reduce([], fn entry, acc ->
+        case entry do
+          :kill ->
+            pid = Process.whereis(name)
+            Process.unlink(pid)
+
+            Process.exit(pid, :kill)
+            await_killed(pid)
+
+            {:ok, _} =
+              Microlsm.start_link(
+                name: name,
+                data_dir: data_dir,
+                reset_counters: false,
+                threshold: threshold
+              )
+
+            check(name, acc)
+
+          [op | args] when op in [:all, :range_read] ->
+            reference = Enum.to_list(apply(ReferenceStore, op, args))
+            microlsm = Enum.to_list(apply(Microlsm, op, args))
+
+            unless reference == microlsm do
+              diff = List.myers_difference(reference, microlsm)
+              diff_keys =
+                diff
+                |> Enum.reject(&match?({:eq, _}, &1))
+                |> Enum.flat_map(fn {_, pairs} -> Enum.map(pairs, fn {key, _value} -> key end) end)
+                |> Enum.into(MapSet.new())
+
+              IO.inspect acc, label: :ops
+
+              for key <- diff_keys do
+                IO.inspect key, label: :key
+                IO.inspect Enum.find(reference, &match?({^key, _}, &1)), label: :reference
+                IO.inspect Enum.find(microlsm, &match?({^key, _}, &1)), label: :microlsm
+                IO.inspect filter_ops(acc, key), label: :ops
+              end
+
+              assert false
+            end
+
+          [op | args] ->
+            assert apply(ReferenceStore, op, args) == apply(Microlsm, op, args)
+        end
+
+        [entry | acc]
       end)
 
     check(name, ops)

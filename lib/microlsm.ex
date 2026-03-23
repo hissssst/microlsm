@@ -70,6 +70,8 @@ defmodule Microlsm do
   * `max_batch_length` (`t:pos_integer/0`) — A maximum size of a batch of entries before performing dump to WAL. Defaults to `10000`.
 
   * `memtable_read_ahead` (`t:pos_integer/0`) — An amount of entries to read from memtable in one call. Defaults to `1000`.
+
+  * `reset_counters` (`t:boolean/0`) — Whether to reset the stats counters on start. Defaults to `true`.
   """
   @type start_option ::
           {:name, t()}
@@ -288,6 +290,7 @@ defmodule Microlsm do
 
     AtomicFlags.switch(atomics_ref, :reading) do
       {memtable, shadow_memtable} = AtomicFlags.order(atomics_ref, :memtables, mt1, mt2)
+      gentable = AtomicFlags.select(atomics_ref, :gentables, gt1, gt2)
 
       result =
         with(
@@ -295,7 +298,6 @@ defmodule Microlsm do
           :error <- Memtable.read(shadow_memtable, key)
         ) do
           ODCounter.add(Microlsm, name, :memtable_miss)
-          gentable = AtomicFlags.select(atomics_ref, :gentables, gt1, gt2)
           generations = Gentable.to_list(gentable)
           disktable_read(generations, key, descriptor_pool, name)
         else
@@ -592,7 +594,10 @@ defmodule Microlsm do
 
     ODCounter.init_schema(Microlsm, runtime_size: 16, ignore_if_exists: true)
     ODCounter.new(Microlsm, name, ignore_if_exists: true)
-    ODCounter.reset(Microlsm, name)
+
+    if opts[:reset_counters] do
+      ODCounter.reset(Microlsm, name)
+    end
 
     data_dir = Path.expand(Keyword.fetch!(opts, :data_dir))
     check_or_write_lock(data_dir)
@@ -623,7 +628,7 @@ defmodule Microlsm do
       dlog(:mkdir_p_disktable_dir)
     end
 
-    restore_disktables(disktable_dir, descriptor_pool, gentable, descriptor_pool_size)
+    last_id = restore_disktables(disktable_dir, descriptor_pool, gentable, descriptor_pool_size)
 
     state = %{
       merge_ref: nil,
@@ -642,6 +647,7 @@ defmodule Microlsm do
       shadow_wal: shadow_wal,
       wal_swap_flag_fd: wal_swap_flag_fd,
 
+      last_id: last_id,
       batch_length: 0,
       batch: [],
       reply_tos: []
@@ -652,46 +658,60 @@ defmodule Microlsm do
   end
 
   defp restore_disktables(disktable_dir, descriptor_pool, gentable, descriptor_pool_size) do
-    generations =
+    {generations, last_id} =
       disktable_dir
       |> File.ls!()
       |> Enum.map(fn filename ->
         [generation, id] = String.split(filename, "_")
-        {String.to_integer(generation), id, Path.join(disktable_dir, filename)}
+        generation = String.to_integer(generation)
+        id = String.to_integer(id)
+        {generation, id, Path.join(disktable_dir, filename)}
       end)
-      |> Enum.reduce(%{}, fn {generation, id, filename}, groups ->
+      |> Enum.reduce({%{}, 0}, fn {generation, id, filename}, {groups, last_id} ->
         {:ok, fd} = :prim_file.open(filename, [:read])
 
-        case Disktable.load(fd) do
-          :broken ->
-            :ok = :prim_file.close(fd)
-            :prim_file.delete(filename)
-            groups
+        groups =
+          case Disktable.load(fd) do
+            :broken ->
+              :ok = :prim_file.close(fd)
+              :prim_file.delete(filename)
+              groups
 
-          {length, max_block_size, index} ->
-            bloom_filter = build_bloom_filter(fd, index, length)
-            descriptor_pool_state = DescriptorPool.add(descriptor_pool, filename, descriptor_pool_size)
+            {length, max_block_size, index} ->
+              bloom_filter = build_bloom_filter(fd, index, length)
+              descriptor_pool_state = DescriptorPool.add(descriptor_pool, filename, descriptor_pool_size)
 
-            entry =
-              disktable(
-                id: id,
-                generation: generation,
-                bloom_filter: bloom_filter,
-                index: index,
-                filename: filename,
-                descriptor_pool_state: descriptor_pool_state,
-                length: length,
-                max_block_size: max_block_size
-              )
+              entry =
+                disktable(
+                  id: id,
+                  generation: generation,
+                  bloom_filter: bloom_filter,
+                  index: index,
+                  filename: filename,
+                  descriptor_pool_state: descriptor_pool_state,
+                  length: length,
+                  max_block_size: max_block_size
+                )
 
-            case groups do
-              %{^generation => entries} -> %{groups | generation => [entry | entries]}
-              %{} -> Map.put(groups, generation, [entry])
-            end
-        end
+              case groups do
+                %{^generation => [disktable(id: id2)]} when id2 > id ->
+                  :prim_file.delete(filename)
+                  groups
+
+                %{^generation => [disktable(id: id2, filename: filename)]} when id2 < id ->
+                  :prim_file.delete(filename)
+                  groups
+
+                groups when not :erlang.map_get(generation, groups) ->
+                  Map.put(groups, generation, [entry])
+              end
+          end
+
+        {groups, max(id, last_id)}
       end)
 
     Gentable.insert(gentable, generations)
+    last_id
   end
 
   defp restore_wals(memtable, shadow_memtable, wal_dir) do
@@ -726,14 +746,14 @@ defmodule Microlsm do
   @doc false
   def handle_continue(:init_dump, state) do
     dlog(:continue_init_dump)
-    %{data_dir: data_dir, name: name, block_size_threshold: block_size_threshold, descriptor_pool_size: descriptor_pool_size} = state
+    %{data_dir: data_dir, name: name, block_size_threshold: block_size_threshold, descriptor_pool_size: descriptor_pool_size, last_id: last_id} = state
 
     {_memtable, shadow_memtable, gentable, descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
 
     if Memtable.empty?(shadow_memtable) do
       {:noreply, state}
     else
-      merge_ref = spawn_merge(gentable, shadow_memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead)
+      merge_ref = spawn_merge(gentable, shadow_memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead, last_id)
       {:noreply, %{state | merge_ref: merge_ref}}
     end
   end
@@ -849,8 +869,8 @@ defmodule Microlsm do
   end
 
   @doc false
-  def handle_info({:microlsm_merge_done, ref}, %{merge_ref: ref} = state) do
-    state = finish_merge(state)
+  def handle_info({:microlsm_merge_done, ref, last_id}, %{merge_ref: ref} = state) do
+    state = finish_merge(state, last_id)
     {:noreply, state, {:continue, :dump}}
   end
 
@@ -919,8 +939,8 @@ defmodule Microlsm do
 
   defp await_merge_finish(merge_ref, state) when not is_nil(merge_ref) do
     receive do
-      {:microlsm_merge_done, ^merge_ref} ->
-        finish_merge(state)
+      {:microlsm_merge_done, ^merge_ref, last_id} ->
+        finish_merge(state, last_id)
     end
   end
 
@@ -936,7 +956,14 @@ defmodule Microlsm do
   ## Compaction
 
   defp start_dump(state) do
-    %{data_dir: data_dir, name: name, block_size_threshold: block_size_threshold, descriptor_pool_size: descriptor_pool_size} = state
+    %{
+      data_dir: data_dir,
+      name: name,
+      block_size_threshold: block_size_threshold,
+      descriptor_pool_size: descriptor_pool_size,
+      last_id: last_id
+    } = state
+
     ODCounter.add(Microlsm, name, :dumps_started)
 
     {memtable, _shadow_memtable, gentable, descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
@@ -944,12 +971,12 @@ defmodule Microlsm do
     state = swap_wals(state)
     swap_memtables(name)
 
-    merge_ref = spawn_merge(gentable, memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead)
+    merge_ref = spawn_merge(gentable, memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead, last_id)
 
     %{state | merge_ref: merge_ref}
   end
 
-  defp spawn_merge(gentable, memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead) do
+  defp spawn_merge(gentable, memtable, data_dir, name, descriptor_pool, block_size_threshold, descriptor_pool_size, memtable_read_ahead, last_id) do
     owner = self()
     merge_ref = make_ref()
 
@@ -964,7 +991,7 @@ defmodule Microlsm do
           {key, term_to_iovec(value)}
         end)
 
-      {new_generations, to_delete} =
+      {new_generations, to_delete, last_id} =
         merge(
           generations,
           Memtable.length(memtable),
@@ -975,7 +1002,8 @@ defmodule Microlsm do
           Path.join(data_dir, "disktables"),
           descriptor_pool,
           block_size_threshold,
-          descriptor_pool_size
+          descriptor_pool_size,
+          last_id
         )
 
       shadow_gentable = get_shadow_gentable(name)
@@ -992,16 +1020,16 @@ defmodule Microlsm do
         :prim_file.delete(filename)
       end
 
-      send(owner, {:microlsm_merge_done, merge_ref})
+      send(owner, {:microlsm_merge_done, merge_ref, last_id})
     end)
 
     merge_ref
   end
 
-  defp finish_merge(state) do
+  defp finish_merge(state, last_id) do
     %{shadow_wal: shadow_wal} = state
     shadow_wal = Wal.truncate(shadow_wal)
-    %{state | shadow_wal: shadow_wal, merge_ref: nil}
+    %{state | shadow_wal: shadow_wal, merge_ref: nil, last_id: last_id}
   end
 
   @encoded_deletes [term_to_iovec({}), term_to_binary({})]
@@ -1016,11 +1044,12 @@ defmodule Microlsm do
          disktable_dir,
          descriptor_pool,
          block_size_threshold,
-         descriptor_pool_size
+         descriptor_pool_size,
+         last_id
        ) do
     case generations do
       [{^generation, disktables} | generations] ->
-        {disktable(descriptor_pool_state: descriptor_pool_state, filename: filename)} = disktables #FIXME
+        {disktable(descriptor_pool_state: descriptor_pool_state, filename: filename)} = disktables
         {:ok, fd} = :prim_file.open(filename, [:read])
         {rlength, _, rstream} = Disktable.header_and_stream(fd)
         stream = Microlsm.Stream.merge_streams(stream, rstream)
@@ -1037,11 +1066,13 @@ defmodule Microlsm do
           disktable_dir,
           descriptor_pool,
           block_size_threshold,
-          descriptor_pool_size
+          descriptor_pool_size,
+          last_id
         )
 
       _ ->
-        write_full_filename = filename_for_generation(disktable_dir, generation)
+        last_id = last_id + 1
+        write_full_filename = filename_for_generation(disktable_dir, generation, last_id)
         {:ok, fd} = :prim_file.open(write_full_filename, [:write, :read])
 
         {index, bloom_filter, max_block_size, table_length} =
@@ -1058,14 +1089,13 @@ defmodule Microlsm do
         :prim_file.close(fd)
         backtracked_generation = backtrack_generation(lengths, table_length, generation)
 
-        full_filename =
+        {full_filename, last_id} =
           if backtracked_generation != generation do
-            full_filename = filename_for_generation(disktable_dir, backtracked_generation)
-            # IO.inspect {write_full_filename, full_filename}, label: :renaming
+            full_filename = filename_for_generation(disktable_dir, backtracked_generation, last_id)
             :ok = :prim_file.rename(write_full_filename, full_filename)
-            full_filename
+            {full_filename, last_id}
           else
-            write_full_filename
+            {write_full_filename, last_id}
           end
 
         descriptor_pool_state = DescriptorPool.add(descriptor_pool, full_filename, descriptor_pool_size)
@@ -1081,7 +1111,7 @@ defmodule Microlsm do
             max_block_size: max_block_size
           )
 
-        {[{backtracked_generation, {disktable}} | generations], to_delete}
+        {[{backtracked_generation, {disktable}} | generations], to_delete, last_id}
     end
   end
 
@@ -1093,8 +1123,7 @@ defmodule Microlsm do
     generation
   end
 
-  defp filename_for_generation(disktable_dir, generation) do
-    postfix = DateTime.to_unix(DateTime.utc_now(:millisecond), :millisecond) #FIXME need proper postfix generator
+  defp filename_for_generation(disktable_dir, generation, postfix) do
     fname = "#{generation}_#{postfix}"
     Path.join(disktable_dir, fname)
   end

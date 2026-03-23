@@ -42,7 +42,7 @@ defmodule Microlsm.Gentable do
     :ets.new(:microlsm_generations, [:public, :ordered_set, read_concurrency: true, write_concurrency: false])
   end
 
-  @spec insert(table(), [{non_neg_integer(), [disktable()]}]) :: :ok
+  @spec insert(table(), Enumerable.t({non_neg_integer(), [disktable()]})) :: :ok
   def insert(table, generations) do
     generations =
       Enum.map(generations, fn
