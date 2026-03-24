@@ -3,6 +3,7 @@ defmodule Microlsm.Wal do
 
   import :erlang, only: [term_to_iovec: 1, binary_to_term: 1, iolist_size: 1]
   import Bitwise, only: [<<<: 2]
+  alias Microlsm.Fs
   alias Microlsm.SizeException
 
   # 10MB
@@ -16,7 +17,7 @@ defmodule Microlsm.Wal do
 
   @spec open(Path.t(), ({pos_integer(), [term()]} -> any())) :: t()
   def open(full_wal_path, hook) do
-    {:ok, wal_fd} = :prim_file.open(full_wal_path, [:read, :append, :write])
+    {:ok, wal_fd} = Fs.open(full_wal_path, [:read, :append, :write])
 
     total_length =
       wal_fd
@@ -34,8 +35,8 @@ defmodule Microlsm.Wal do
     {fd, length} = wal
 
     encoded = for op <- ops, do: encode_op(op)
-    :ok = :prim_file.write(fd, encoded)
-    :ok = :prim_file.datasync(fd)
+    :ok = Fs.write(fd, encoded)
+    :ok = Fs.datasync(fd)
 
     {fd, length + ops_length}
   end
@@ -49,9 +50,9 @@ defmodule Microlsm.Wal do
   @spec truncate(t()) :: t()
   def truncate(wal) do
     {fd, _} = wal
-    {:ok, 0} = :prim_file.position(fd, 0)
-    :ok = :prim_file.truncate(fd)
-    :ok = :prim_file.sync(fd)
+    {:ok, 0} = Fs.position(fd, 0)
+    :ok = Fs.truncate(fd)
+    :ok = Fs.sync(fd)
     {fd, 0}
   end
 
@@ -65,7 +66,7 @@ defmodule Microlsm.Wal do
     Stream.resource(
       fn -> {0, <<>>} end,
       fn {offset, head} ->
-        case :prim_file.pread(fd, offset, @batch_read_size) do
+        case Fs.pread(fd, offset, @batch_read_size) do
           {:ok, tail} ->
             {ops, leftover, offset, length} = decode_ops(head <> tail, [], offset, 0)
             {[{length, ops}], {offset, leftover}}

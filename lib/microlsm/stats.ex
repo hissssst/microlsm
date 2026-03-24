@@ -32,6 +32,8 @@ defmodule Microlsm.Stats do
 
     IO.puts "\nRaw table"
 
+    stats = Map.merge(stats, Microlsm.Fs.stats())
+
     table =
       for {name, value} <- stats do
         name = String.pad_trailing(to_string(name), 20)

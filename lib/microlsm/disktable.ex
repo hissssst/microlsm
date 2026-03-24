@@ -2,6 +2,7 @@ defmodule Microlsm.Disktable do
   @moduledoc false
 
   alias Microlsm.BloomFilter
+  alias Microlsm.Fs
   alias Microlsm.SizeException
 
   import :erlang, only: [binary_to_term: 1, element: 2, iolist_size: 1, term_to_iovec: 1]
@@ -81,7 +82,7 @@ defmodule Microlsm.Disktable do
 
   defp do_stream([first_offset, second_offset | block_offsets], fd, {:cont, iacc}, fun) do
     size = second_offset - first_offset
-    {:ok, block} = :prim_file.pread(fd, first_offset, size)
+    {:ok, block} = Fs.pread(fd, first_offset, size)
     pairs = list_block(block)
     block_offsets = [second_offset | block_offsets]
     do_stream_items(pairs, block_offsets, fd, {:cont, iacc}, fun)
@@ -106,37 +107,43 @@ defmodule Microlsm.Disktable do
   end
 
   def range_offsets(index, left_key, right_key) do
-    left_offset =
-      case find_block(index, left_key) do
-        {:exact, offset} -> offset
-        {:range, offset, _} -> offset
-        {:error, :too_small} -> 0
+    left_num =
+      case find_num_block(index, left_key) do
+        {:exact, num, _offset} -> num
+        {:range, num, _, _, _} -> num
+        {:error, :too_small} -> 1
         {:error, :too_big} -> throw :left_too_big
       end
 
-    right_offset =
-      case find_block(index, right_key) do
-        {:exact, offset} -> offset
-        {:range, _, offset} -> offset
+    right_num =
+      case find_num_block(index, right_key) do
+        {:exact, num, _offset} -> num
+        {:range, _, _, num, _} -> num
         {:error, :too_small} -> throw :right_too_small
-        {:error, :too_big} ->
-          {_key, last_offset} = element(tuple_size(index), index)
-          last_offset
+        {:error, :too_big} -> tuple_size(index)
       end
 
-    for {_, block_offset} when block_offset >= left_offset and block_offset <= right_offset <- Tuple.to_list(index) do
-      block_offset
-    end
+    index_to_range(index, left_num, right_num)
   catch
     :left_too_big -> []
     :right_too_small -> []
   end
 
-  def range_stream(_fd, _left_key, _right_key, []) do
+  defp index_to_range(index, i, i) do
+    offset = element(2, element(i, index))
+    [offset]
+  end
+
+  defp index_to_range(index, i, size) do
+    offset = element(2, element(i, index))
+    [offset | index_to_range(index, i + 1, size)]
+  end
+
+  def range_stream(_fd, _left_key, _right_key, [], _max_block_size) do
     []
   end
 
-  def range_stream(fd, left_key, right_key, offsets) do
+  def range_stream(fd, left_key, right_key, offsets, max_block_size) do
     stream =
       Stream.resource(
         fn -> {:first, offsets} end,
@@ -146,12 +153,11 @@ defmodule Microlsm.Disktable do
 
           # Leftmost part
           {:first, [only_offset]} ->
-            kv = read_kv(fd, only_offset, 4 * 1024)
-            {[kv], []}
+            {[], [only_offset]}
 
           {:first, [first_offset, second_offset | block_offsets]} ->
             size = second_offset - first_offset
-            {:ok, block} = :prim_file.pread(fd, first_offset, size)
+            {:ok, block} = Fs.pread(fd, first_offset, size)
 
             pairs =
               block
@@ -162,7 +168,7 @@ defmodule Microlsm.Disktable do
               [] ->
                 # If this was the only part in offset list
                 pairs = filter_pairs_before(pairs, right_key)
-                {pairs, []}
+                {pairs, [second_offset]}
 
               _ ->
                 {pairs, [second_offset | block_offsets]}
@@ -171,19 +177,28 @@ defmodule Microlsm.Disktable do
           # Rightmost part
           [prelast_offset, last_offset] ->
             size = last_offset - prelast_offset
-            {:ok, block} = :prim_file.pread(fd, prelast_offset, size)
+            {:ok, block} = Fs.pread(fd, prelast_offset, size)
 
             pairs =
               block
               |> list_block()
               |> filter_pairs_before(right_key)
 
-            {pairs, []}
+            {pairs, [last_offset]}
+
+          [only_offset] ->
+            {key, _} = pair = read_kv(fd, only_offset, max_block_size)
+
+            if key >= left_key and key <= right_key do
+              {[pair], []}
+            else
+              {:halt, []}
+            end
 
           # Inneer blocks
           [first_offset, second_offset | block_offsets] ->
             size = second_offset - first_offset
-            {:ok, block} = :prim_file.pread(fd, first_offset, size)
+            {:ok, block} = Fs.pread(fd, first_offset, size)
             {list_block(block), [second_offset | block_offsets]}
         end,
         fn _ -> :ok end
@@ -196,23 +211,15 @@ defmodule Microlsm.Disktable do
     filter_pairs_after(tail, min_key)
   end
 
-  defp filter_pairs_after([{key, _value} | _] = pairs, min_key) when key >= min_key do
+  defp filter_pairs_after(pairs, _min_key) do
     pairs
-  end
-
-  defp filter_pairs_after([], _) do
-    []
   end
 
   defp filter_pairs_before([{key, value} | tail], top_key) when key <= top_key do
     [{key, value} | filter_pairs_before(tail, top_key)]
   end
 
-  defp filter_pairs_before([{key, _value} | _], top_key) when key > top_key do
-    []
-  end
-
-  defp filter_pairs_before([], _) do
+  defp filter_pairs_before(_, _top_key) do
     []
   end
 
@@ -233,7 +240,7 @@ defmodule Microlsm.Disktable do
   end
 
   defp read_kv(fd, offset, read_size) do
-    {:ok, binary} = :prim_file.pread(fd, offset, read_size)
+    {:ok, binary} = Fs.pread(fd, offset, read_size)
     case binary do
       <<keysize::@keysize_size, valuesize::@valuesize_size, encoded_key::binary-size(keysize), encoded_value::binary-size(valuesize), _::binary>> ->
         {binary_to_term(encoded_key), encoded_value}
@@ -246,8 +253,8 @@ defmodule Microlsm.Disktable do
   ## Writing
 
   def truncate(fd) do
-    :ok = :prim_file.truncate(fd)
-    :ok = :prim_file.sync(fd)
+    :ok = Fs.truncate(fd)
+    :ok = Fs.sync(fd)
   end
 
   def write_stream(stream, fd, approx_length, block_size_threshold) do
@@ -318,10 +325,10 @@ defmodule Microlsm.Disktable do
     index = index(key_to_blocks)
     block_offsets = Enum.map(key_to_blocks, fn {_, offset} -> offset end)
     write_footer(fd, offset, block_offsets)
-    :prim_file.datasync(fd)
+    Fs.datasync(fd)
 
     write_header(fd, offset, len, max_block_size, :ready)
-    :prim_file.sync(fd)
+    Fs.sync(fd)
 
     bloom_filter = BloomFilter.finalize(bloom_filter_builder)
     {index, bloom_filter, max_block_size, len}
@@ -357,6 +364,19 @@ defmodule Microlsm.Disktable do
   ## Search
 
   def find_block(index, key) do
+    case find_num_block(index, key) do
+      {:exact, _num, offset} ->
+        {:exact, offset}
+
+      {:range, _lnum, loffset, _rnum, roffset} ->
+        {:range, loffset, roffset}
+
+      other ->
+        other
+    end
+  end
+
+  def find_num_block(index, key) do
     size = tuple_size(index)
 
     case {element(1, index), element(size, index)} do
@@ -364,10 +384,10 @@ defmodule Microlsm.Disktable do
         do_find_block(index, key, 1, size)
 
       {{^key, block_offset}, {_right_key, _}} ->
-        {:exact, block_offset}
+        {:exact, 1, block_offset}
 
       {{_left_key, _}, {^key, block_offset}} ->
-        {:exact, block_offset}
+        {:exact, size, block_offset}
 
       {{left_key, _}, _} when key < left_key ->
         {:error, :too_small}
@@ -404,17 +424,17 @@ defmodule Microlsm.Disktable do
       ^left ->
         case middle_key do
           ^key ->
-            {:exact, middle_block}
+            {:exact, middle, middle_block}
 
           _ ->
             {_, right_block} = element(right, index)
-            {:range, middle_block, right_block}
+            {:range, middle, middle_block, middle + 1, right_block}
         end
 
       _ ->
         case middle_key do
           ^key ->
-            {:exact, middle_block}
+            {:exact, middle, middle_block}
 
           middle_key when middle_key < key ->
             do_find_block(index, key, middle, right)
@@ -432,7 +452,7 @@ defmodule Microlsm.Disktable do
         {:ok, binary_to_term(encoded_value)}
 
       {:range, left, right} ->
-        {:ok, chunk} = :prim_file.pread(fd, left, right - left)
+        {:ok, chunk} = Fs.pread(fd, left, right - left)
         find_in_block(chunk, key)
 
       other ->
@@ -489,7 +509,7 @@ defmodule Microlsm.Disktable do
   end
 
   defp read_header(fd) do
-    case :prim_file.pread(fd, 0, 36) do
+    case Fs.pread(fd, 0, 36) do
       {:ok, <<@magic, magic_readiness :: 32, len::64, max_block_size::64, block_offsets_offset::64>>} ->
         ready =
           case magic_readiness do
@@ -520,10 +540,10 @@ defmodule Microlsm.Disktable do
   end
 
   defp read_footer(fd, block_offsets_offset, readsize) do
-    {:ok, <<block_count::64, rest::binary>>} = :prim_file.pread(fd, block_offsets_offset, readsize)
+    {:ok, <<block_count::64, rest::binary>>} = Fs.pread(fd, block_offsets_offset, readsize)
     block_offsets =
       if byte_size(rest) < 8 * block_count do
-        {:ok, block_offsets} = :prim_file.pread(fd, block_offsets_offset + 8, 8 * block_count)
+        {:ok, block_offsets} = Fs.pread(fd, block_offsets_offset + 8, 8 * block_count)
         block_offsets
       else
         rest
@@ -543,6 +563,6 @@ defmodule Microlsm.Disktable do
   defp pwrite(fd, offset, iovec) do
     name = Process.get(:microlsm_name)
     ODCounter.add(Microlsm, name, :pwrites)
-    :prim_file.pwrite(fd, offset, iovec)
+    Fs.pwrite(fd, offset, iovec)
   end
 end

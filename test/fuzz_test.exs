@@ -398,21 +398,24 @@ defmodule Microlsm.FuzzTest do
             reference = Enum.to_list(apply(ReferenceStore, op, args))
             microlsm = Enum.to_list(apply(Microlsm, op, args))
 
-            unless reference == microlsm do
-              diff = List.myers_difference(reference, microlsm)
+            with [_, _ | _] = diff <- List.myers_difference(reference, microlsm) do
               diff_keys =
                 diff
                 |> Enum.reject(&match?({:eq, _}, &1))
                 |> Enum.flat_map(fn {_, pairs} -> Enum.map(pairs, fn {key, _value} -> key end) end)
                 |> Enum.into(MapSet.new())
 
-              IO.inspect acc, label: :ops
+              IO.inspect entry, label: :operation
 
               for key <- diff_keys do
+                loc = Microlsm.location(name, key)
                 IO.inspect key, label: :key
                 IO.inspect Enum.find(reference, &match?({^key, _}, &1)), label: :reference
                 IO.inspect Enum.find(microlsm, &match?({^key, _}, &1)), label: :microlsm
+                IO.inspect Enum.find(apply(Microlsm, op, args), &match?({^key, _}, &1)), label: :microlsm_retry
                 IO.inspect filter_ops(acc, key), label: :ops
+                IO.inspect loc, label: :location
+                IO.puts ""
               end
 
               assert false

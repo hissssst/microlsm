@@ -17,6 +17,8 @@ defmodule Microlsm.DescriptorPool do
 
   import Microlsm.Debug
 
+  alias Microlsm.Fs
+
   @spec new() :: pool()
   def new do
     table = :ets.new(__MODULE__, [:set, :public])
@@ -55,11 +57,11 @@ defmodule Microlsm.DescriptorPool do
     end
 
     def checkout(_pool, filename, func, _timeout \\ nil) do
-      {:ok, fd} = :prim_file.open(filename, [:read])
+      {:ok, fd} = Fs.open(filename, [:read])
       try do
         func.(fd)
       after
-        :prim_file.close(fd)
+        Fs.close(fd)
       end
     end
   else
@@ -171,7 +173,7 @@ defmodule Microlsm.DescriptorPool do
     cell =
       spawn_link(fn ->
         Process.flag(:priority, :high)
-        {:ok, fd} = :prim_file.open(filename, [:read])
+        {:ok, fd} = Fs.open(filename, [:read])
         ms = [{{{filename_ref, index}, :_, :_}, [], [{{{{filename_ref, index}}, as, self()}}]}]
         1 = :ets.select_replace(table, ms)
         send(owner, ref)

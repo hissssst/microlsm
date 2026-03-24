@@ -3,6 +3,7 @@ defmodule Microlsm.Gentable do
   alias Microlsm.BloomFilter
   alias Microlsm.Disktable
   alias Microlsm.DescriptorPool
+  alias Microlsm.Fs
 
   import Record, only: [defrecord: 2]
   import Disktable, only: [is_inbound: 1]
@@ -72,15 +73,20 @@ defmodule Microlsm.Gentable do
 
   @spec remove(table()) :: :ok
   def remove(table) do
-    for {_, disktables} <- to_list(table), dt <- Tuple.to_list(disktables) do
-      disktable(filename: filename) = dt
-      {:ok, fd} = :prim_file.open(filename, [:read, :write])
-      Disktable.truncate(fd)
-      :prim_file.close(fd)
-      File.rm!(filename)
-    end
+    filenames =
+      for {_, disktables} <- to_list(table), dt <- Tuple.to_list(disktables) do
+        disktable(filename: filename) = dt
+        {:ok, fd} = Fs.open(filename, [:read, :write])
+        Disktable.truncate(fd)
+        Fs.close(fd)
+        filename
+      end
 
     clear(table)
+
+    for filename <- filenames do
+      Fs.delete(filename)
+    end
 
     :ok
   end

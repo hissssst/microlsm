@@ -9,6 +9,7 @@ defmodule Microlsm do
   alias Microlsm.BloomFilter
   alias Microlsm.DescriptorPool
   alias Microlsm.Disktable
+  alias Microlsm.Fs
   alias Microlsm.Gentable
   alias Microlsm.Memtable
   alias Microlsm.Wal
@@ -381,8 +382,7 @@ defmodule Microlsm do
     global_state(atomics_ref: atomics_ref) = :persistent_term.get({Microlsm, name})
 
     AtomicFlags.switch(atomics_ref, :reading) do
-      {memtable, shadow_memtable, gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
-      generations = Gentable.to_list(gentable)
+      {memtable, shadow_memtable, _gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
 
       memtable_stream = Memtable.stream(memtable, memtable_read_ahead)
       shadow_memtable_stream = Memtable.stream(shadow_memtable, memtable_read_ahead)
@@ -392,13 +392,15 @@ defmodule Microlsm do
       # To avoid funny inconsistencies
       all_memtables_list = Enum.to_list(all_memtables_stream)
 
+      #TODO optimize
+      {_memtable, _shadow_memtable, gentable, _descriptor_pool, _memtable_read_ahead} = get_memtable_and_gentable(name)
+      generations = Gentable.to_list(gentable)
+
       {fds, stream} =
         Enum.reduce(generations, {[], all_memtables_list}, fn {_, {disktable(filename: filename, index: index)}}, {fds, stream} ->
-          # IO.inspect filename, label: :filename
-          # IO.inspect generations, label: :generations
           {:ok, fd} =
-            with {:error, :enoent} <- :prim_file.open(filename, [:read]) do
-              for fd <- fds, do: :prim_file.close(fd)
+            with {:error, :enoent} <- Fs.open(filename, [:read]) do
+              for fd <- fds, do: Fs.close(fd)
               throw :retry
             end
 
@@ -438,13 +440,19 @@ defmodule Microlsm do
       [{:key2, :value2}, {:key3, :value3}, {:key4, :value4}]
   """
   @spec range_read(t(), key(), key()) :: Enumerable.t({key(), value()})
-  def range_read(name, left_key, right_key) when left_key <= right_key do
+  def range_read(name, key, key) do
+    case read(name, key) do
+      {:ok, value} -> [{key, value}]
+      :error -> []
+    end
+  end
+
+  def range_read(name, left_key, right_key) when left_key < right_key do
     assert_alive!(name)
     global_state(atomics_ref: atomics_ref) = :persistent_term.get({Microlsm, name})
 
     AtomicFlags.switch(atomics_ref, :reading) do
-      {memtable, shadow_memtable, gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
-      generations = Gentable.to_list(gentable)
+      {memtable, shadow_memtable, _gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
       memtable_stream = Memtable.range_read(memtable, left_key, right_key, memtable_read_ahead)
       shadow_memtable_stream = Memtable.range_read(shadow_memtable, left_key, right_key, memtable_read_ahead)
 
@@ -453,20 +461,23 @@ defmodule Microlsm do
       # To avoid funny inconsistencies
       all_memtables_list = Enum.to_list(all_memtables_stream)
 
+      {_memtable, _shadow_memtable, gentable, _descriptor_pool, _memtable_read_ahead} = get_memtable_and_gentable(name)
+      generations = Gentable.to_list(gentable)
+
       {fds, stream} =
-        Enum.reduce(generations, {[], all_memtables_list}, fn {_, {disktable(filename: filename, index: index)}}, {fds, stream} ->
+        Enum.reduce(generations, {[], all_memtables_list}, fn {_, {disktable(filename: filename, index: index, max_block_size: max_block_size)}}, {fds, stream} ->
           case Disktable.range_offsets(index, left_key, right_key) do
             [] ->
               {fds, stream}
 
             offsets ->
               {:ok, fd} =
-                with {:error, :enoent} <- :prim_file.open(filename, [:read]) do
-                  for fd <- fds, do: :prim_file.close(fd)
+                with {:error, :enoent} <- Fs.open(filename, [:read]) do
+                  for fd <- fds, do: Fs.close(fd)
                   throw :retry
                 end
 
-              disk_stream = Disktable.range_stream(fd, left_key, right_key, offsets)
+              disk_stream = Disktable.range_stream(fd, left_key, right_key, offsets, max_block_size)
               stream = Microlsm.Stream.merge_streams(stream, disk_stream)
               {[fd | fds], stream}
           end
@@ -482,8 +493,8 @@ defmodule Microlsm do
       all(name)
   end
 
-  defp finalize_read_stream(stream, fds) do
-    stream
+  defp finalize_read_stream(enumerable, fds) do
+    enumerable
     |> Stream.flat_map(fn
       {key, binary} when is_binary(binary) ->
         case binary_to_term(binary) do
@@ -497,8 +508,16 @@ defmodule Microlsm do
       {_, {}} ->
         []
     end)
-    |> Microlsm.Stream.after_hook(fn ->
-      Enum.each(fds, &:prim_file.close/1)
+    |> maybe_add_after_hook(fds)
+  end
+
+  defp maybe_add_after_hook(enumerable, []) do
+    enumerable
+  end
+
+  defp maybe_add_after_hook(enumerable, fds) do
+    Microlsm.Stream.after_hook(enumerable, fn ->
+      Enum.each(fds, &Fs.close/1)
     end)
   end
 
@@ -537,17 +556,17 @@ defmodule Microlsm do
       index: index
     ) = disktable
 
-    {:ok, fd} = :prim_file.open(filename, [:read])
+    {:ok, fd} = Fs.open(filename, [:read])
 
     bloom_check = BloomFilter.check(bloom_filter, key)
     try do
       block = Disktable.find_block(index, key)
-      Disktable.find_value(fd, block, key, max_block_size)
-    else
-      {:ok, value} -> {:disktable, generation, bloom_check, value, filename}
-      {:error, _} -> disktable_location(rest, key)
+      case Disktable.find_value(fd, block, key, max_block_size) do
+        {:ok, value} -> {:disktable, generation, bloom_check, value, filename, block}
+        {:error, _} -> disktable_location(rest, key)
+      end
     after
-      :prim_file.close(fd)
+      Fs.close(fd)
     end
   end
 
@@ -592,8 +611,9 @@ defmodule Microlsm do
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
 
-    ODCounter.init_schema(Microlsm, runtime_size: 16, ignore_if_exists: true)
+    ODCounter.init_schema(Microlsm, runtime_size: 40, ignore_if_exists: true)
     ODCounter.new(Microlsm, name, ignore_if_exists: true)
+    Fs.init_counters()
 
     if opts[:reset_counters] do
       ODCounter.reset(Microlsm, name)
@@ -668,13 +688,13 @@ defmodule Microlsm do
         {generation, id, Path.join(disktable_dir, filename)}
       end)
       |> Enum.reduce({%{}, 0}, fn {generation, id, filename}, {groups, last_id} ->
-        {:ok, fd} = :prim_file.open(filename, [:read])
+        {:ok, fd} = Fs.open(filename, [:read])
 
         groups =
           case Disktable.load(fd) do
             :broken ->
-              :ok = :prim_file.close(fd)
-              :prim_file.delete(filename)
+              :ok = Fs.close(fd)
+              Fs.delete(filename)
               groups
 
             {length, max_block_size, index} ->
@@ -694,15 +714,18 @@ defmodule Microlsm do
                 )
 
               case groups do
-                %{^generation => [disktable(id: id2)]} when id2 > id ->
-                  :prim_file.delete(filename)
-                  groups
+                %{^generation => disktables} ->
+                  case disktables do
+                    [disktable(id: id2)] when id2 > id ->
+                      Fs.delete(filename)
+                      groups
 
-                %{^generation => [disktable(id: id2, filename: filename)]} when id2 < id ->
-                  :prim_file.delete(filename)
-                  groups
+                    [disktable(id: id2, filename: filename)] when id2 < id ->
+                      Fs.delete(filename)
+                      groups
+                  end
 
-                groups when not :erlang.map_get(generation, groups) ->
+                groups ->
                   Map.put(groups, generation, [entry])
               end
           end
@@ -716,12 +739,12 @@ defmodule Microlsm do
 
   defp restore_wals(memtable, shadow_memtable, wal_dir) do
     full_current_path = Path.expand(Path.join(wal_dir, "current"))
-    {:ok, wal_swap_flag_fd} = :prim_file.open(full_current_path, [:read, :write])
+    {:ok, wal_swap_flag_fd} = Fs.open(full_current_path, [:read, :write])
 
-    case :prim_file.pread(wal_swap_flag_fd, 0, 1) do
+    case Fs.pread(wal_swap_flag_fd, 0, 1) do
       :eof ->
-        :prim_file.pwrite(wal_swap_flag_fd, 0, "0")
-        :prim_file.sync(wal_swap_flag_fd)
+        Fs.pwrite(wal_swap_flag_fd, 0, "0")
+        Fs.sync(wal_swap_flag_fd)
 
         {restore_wal(wal_dir, "0", memtable), restore_wal(wal_dir, "1", shadow_memtable), wal_swap_flag_fd}
 
@@ -1014,10 +1037,9 @@ defmodule Microlsm do
       Memtable.clear(memtable)
 
       for {fd, filename, descriptor_pool_state} <- to_delete do
-        # IO.inspect filename, label: :deleting
-        :prim_file.close(fd)
+        Fs.close(fd)
         DescriptorPool.remove(descriptor_pool, descriptor_pool_state)
-        :prim_file.delete(filename)
+        Fs.delete(filename)
       end
 
       send(owner, {:microlsm_merge_done, merge_ref, last_id})
@@ -1050,7 +1072,7 @@ defmodule Microlsm do
     case generations do
       [{^generation, disktables} | generations] ->
         {disktable(descriptor_pool_state: descriptor_pool_state, filename: filename)} = disktables
-        {:ok, fd} = :prim_file.open(filename, [:read])
+        {:ok, fd} = Fs.open(filename, [:read])
         {rlength, _, rstream} = Disktable.header_and_stream(fd)
         stream = Microlsm.Stream.merge_streams(stream, rstream)
 
@@ -1073,7 +1095,7 @@ defmodule Microlsm do
       _ ->
         last_id = last_id + 1
         write_full_filename = filename_for_generation(disktable_dir, generation, last_id)
-        {:ok, fd} = :prim_file.open(write_full_filename, [:write, :read])
+        {:ok, fd} = Fs.open(write_full_filename, [:write, :read])
 
         {index, bloom_filter, max_block_size, table_length} =
           case generations do
@@ -1086,13 +1108,13 @@ defmodule Microlsm do
           end
           |> Disktable.write_stream(fd, total_length, block_size_threshold)
 
-        :prim_file.close(fd)
+        Fs.close(fd)
         backtracked_generation = backtrack_generation(lengths, table_length, generation)
 
         {full_filename, last_id} =
           if backtracked_generation != generation do
             full_filename = filename_for_generation(disktable_dir, backtracked_generation, last_id)
-            :ok = :prim_file.rename(write_full_filename, full_filename)
+            :ok = Fs.rename(write_full_filename, full_filename)
             {full_filename, last_id}
           else
             {write_full_filename, last_id}
@@ -1143,11 +1165,11 @@ defmodule Microlsm do
 
   defp check_or_write_lock(data_dir) do
     full_lock_path = Path.join(data_dir, "lock")
-    {:ok, fd} = :prim_file.open(full_lock_path, [:read, :write])
+    {:ok, fd} = Fs.open(full_lock_path, [:read, :write])
 
     try do
       with(
-        {:ok, data} <- :prim_file.pread(fd, 0, 4 * 1024),
+        {:ok, data} <- Fs.pread(fd, 0, 4 * 1024),
         %{os: os, pid: pid} <- binary_to_term(data),
         ^os <- System.pid(),
         true <- Process.alive?(pid)
@@ -1157,13 +1179,13 @@ defmodule Microlsm do
         _ -> write_lock(fd)
       end
     after
-      :prim_file.close(fd)
+      Fs.close(fd)
     end
   end
 
   defp write_lock(fd) do
     data = term_to_iovec(%{os: System.pid(), pid: self()})
-    :prim_file.pwrite(fd, 0, data)
+    Fs.pwrite(fd, 0, data)
   end
 
   ## Compaction swap
@@ -1172,13 +1194,13 @@ defmodule Microlsm do
     %{wal: working_wal, shadow_wal: shadow_wal, wal_swap_flag_fd: wal_swap_flag_fd} = state
 
     to_write =
-      case :prim_file.pread(wal_swap_flag_fd, 0, 8) do
+      case Fs.pread(wal_swap_flag_fd, 0, 8) do
         {:ok, "0"} -> "1"
         {:ok, "1"} -> "0"
       end
 
-    :prim_file.pwrite(wal_swap_flag_fd, 0, to_write)
-    :prim_file.sync(wal_swap_flag_fd)
+    Fs.pwrite(wal_swap_flag_fd, 0, to_write)
+    Fs.sync(wal_swap_flag_fd)
 
     %{state | wal: shadow_wal, shadow_wal: working_wal}
   end

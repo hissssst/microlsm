@@ -1,6 +1,7 @@
 defmodule Microlsm.DescriptorPoolTest do
   use ExUnit.Case, async: true
   alias Microlsm.DescriptorPool
+  alias Microlsm.Fs
 
   setup tags do
     count = Map.get(tags, :count, 10)
@@ -14,7 +15,7 @@ defmodule Microlsm.DescriptorPoolTest do
   test "Just works", %{pool: pool, state: state} do
     result =
       DescriptorPool.checkout(pool, state, fn fd ->
-        :prim_file.pread(fd, 0, 9)
+        Fs.pread(fd, 0, 9)
       end)
 
     assert result == {:ok, "defmodule"}
@@ -39,7 +40,7 @@ defmodule Microlsm.DescriptorPoolTest do
 
     result =
       DescriptorPool.checkout(pool, state, fn fd ->
-        :prim_file.pread(fd, 0, 9)
+        Fs.pread(fd, 0, 9)
       end)
 
     assert result == {:ok, "defmodule"}
