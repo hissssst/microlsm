@@ -66,6 +66,11 @@ defmodule Microlsm.DescriptorPool do
     end
   else
     @spec add(pool(), filename :: String.t(), pos_integer()) :: t()
+    def add(_pool, filename, 1) do
+      filename_ref = :erlang.unique_integer()
+      {filename_ref, filename}
+    end
+
     def add(_pool, filename, count) do
       filename_ref = :erlang.unique_integer()
       atomics_ref = :atomics.new(1, signed: false)
@@ -76,36 +81,38 @@ defmodule Microlsm.DescriptorPool do
     @spec remove(pool(), t()) :: :ok
     def remove(pool, state) do
       {table, _sup} = pool
-      {filename_ref, _atomics_ref, _count, _filename} = state
+      filename_ref = elem(state, 0)
       pattern = {{filename_ref, :_}, :_, :_}
       :ets.select_delete(table, [{pattern, [], [true]}])
       :ok
     end
 
-    @spec checkout(pool(), t(), (tuple() -> result), timeout()) :: result
+    @spec checkout(pool(), t(), (tuple() -> result), timeout()) :: {:ok, result}
     when result: term()
-    def checkout(pool, state, func, timeout \\ 5_000) do
+    def checkout(pool, {filename_ref, atomics_ref, count, filename}, func, timeout \\ 5_000) do
       {table, sup} = pool
-      {filename_ref, atomics_ref, count, filename} = state
-      {_index, cell} = checkout_cell(sup, table, filename_ref, filename, atomics_ref, count)
-      dlog({:checked_out, filename_ref, index, filename, cell})
-      monitor_ref = Process.monitor(cell, alias: :reply_demonitor)
-      send(cell, {:execute, monitor_ref, func, self()})
-      receive do
-        {^monitor_ref, :ok, result} ->
-          result
 
-        {^monitor_ref, kind, error, stacktrace} ->
-          {:current_stacktrace, current_stacktrace} = Process.info(self(), :current_stacktrace)
-          [_process_info_call | current_stacktrace] = current_stacktrace
-          :erlang.raise(kind, error, stacktrace ++ current_stacktrace)
+      with {:ok, {_index, cell}} <- checkout_cell(sup, table, filename_ref, filename, atomics_ref, count) do
+        dlog({:checked_out, filename_ref, index, filename, cell})
+        monitor_ref = Process.monitor(cell, alias: :reply_demonitor)
+        send(cell, {:execute, monitor_ref, func, self()})
 
-        {:DOWN, ^monitor_ref, :process, ^cell, reason} ->
-          raise "Cell exited with #{inspect(reason)}"
+        receive do
+          {^monitor_ref, :ok, result} ->
+            {:ok, result}
 
-        after timeout ->
-          Process.demonitor(monitor_ref, [:flush])
-          raise "Timeout"
+          {^monitor_ref, kind, error, stacktrace} ->
+            {:current_stacktrace, current_stacktrace} = Process.info(self(), :current_stacktrace)
+            [_process_info_call | current_stacktrace] = current_stacktrace
+            :erlang.raise(kind, error, stacktrace ++ current_stacktrace)
+
+          {:DOWN, ^monitor_ref, :process, ^cell, reason} ->
+            raise "Cell exited with #{inspect(reason)}"
+
+          after timeout ->
+            Process.demonitor(monitor_ref, [:flush])
+            raise "Timeout"
+        end
       end
     end
   end
@@ -159,11 +166,12 @@ defmodule Microlsm.DescriptorPool do
     spec = %{
       id: {filename_ref, index},
       start: {__MODULE__, :do_start_cell, [table, filename_ref, index, filename, as]},
-      restart: :transient
+      type: :worker,
+      shutdown: :brutal_kill,
+      restart: :temporary
     }
 
-    {:ok, cell} = DynamicSupervisor.start_child(sup, spec)
-    cell
+    DynamicSupervisor.start_child(sup, spec)
   end
 
   def do_start_cell(table, filename_ref, index, filename, as) do
@@ -173,15 +181,28 @@ defmodule Microlsm.DescriptorPool do
     cell =
       spawn_link(fn ->
         Process.flag(:priority, :high)
-        {:ok, fd} = Fs.open(filename, [:read])
-        ms = [{{{filename_ref, index}, :_, :_}, [], [{{{{filename_ref, index}}, as, self()}}]}]
-        1 = :ets.select_replace(table, ms)
-        send(owner, ref)
-        loop_cell(fd, filename_ref, table, index)
+
+        case Fs.open(filename, [:read]) do
+          {:ok, fd} ->
+            ms = [{{{filename_ref, index}, :_, :_}, [], [{{{{filename_ref, index}}, as, self()}}]}]
+            1 = :ets.select_replace(table, ms)
+            send(owner, {ref, :ok})
+            loop_cell(fd, filename_ref, table, index)
+
+          {:error, reason} ->
+            send(owner, {ref, {:error, reason}})
+        end
       end)
 
     receive do
-      ^ref -> {:ok, cell}
+      {^ref, :ok} ->
+        {:ok, cell}
+
+      {^ref, {:error, reason}} ->
+        {:error, reason}
+
+      after 5_000 ->
+        raise "Failed to open a file in 5 seconds"
     end
   end
 
@@ -208,13 +229,18 @@ defmodule Microlsm.DescriptorPool do
 
           1 ->
             [{{^filename_ref, ^index}, ^owner, cell}] = :ets.lookup(table, {filename_ref, index})
-            {index, cell}
+            {:ok, {index, cell}}
         end
 
       true ->
-        cell = start_cell(sup, table, filename_ref, index, filename, self())
-        dlog(:lazy_descriptor_init)
-        {index, cell}
+        case start_cell(sup, table, filename_ref, index, filename, self()) do
+          {:ok, cell} ->
+            dlog(:lazy_descriptor_init)
+            {:ok, {index, cell}}
+
+          error ->
+            error
+        end
     end
   end
 end

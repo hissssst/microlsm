@@ -1,6 +1,8 @@
 ## TODO
 
-[ ] Test range reads
+[ ] Optimize retries in mread and stuff
+    FYI: Retries happen when compaction starts and finishes during the operation
+    (operaion meaning mread or something).
 
 [ ] README
 
@@ -27,6 +29,8 @@
 [ ] Investigate non-log2 structure of SST heirarchy
     That means some logN
 
+[ ] Optimize find_block to always use num version of function
+
 ## WONT DO
 
 [?] Split descriptor pool into different ets tables
@@ -42,6 +46,8 @@
 
 ## DONE
 
+[x] Implement proper mread
+[x] Test range reads
 [x] Backtracking generation for overwrite-only scenarios
 [x] Configuration of parameters at start_link (including spawn_opt)
 [x] Cleanup and drop table

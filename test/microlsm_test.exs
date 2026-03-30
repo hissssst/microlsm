@@ -87,6 +87,22 @@ defmodule MicrolsmTest do
     end
   end
 
+  test "mread", %{name: name, data_dir: data_dir} do
+    {:ok, _pid} = Microlsm.start_link(name: name, data_dir: data_dir, wal_length_threshold: 9)
+    batch = for i <- 1..5, do: {:write, i, i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    batch = for i <- 6..10, do: {:write, i, i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    batch = for i <- 11..15, do: {:write, i, i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    Process.sleep 300
+
+    assert %{1 => 1, 2 => 2} = Microlsm.mread(name, [0, 1, 2, 1234])
+  end
+
   test "Recovers on a single key rewrite", %{name: name, data_dir: data_dir} do
     {:ok, pid} = Microlsm.start_link(name: name, data_dir: data_dir)
     assert :ok = Microlsm.write(name, "key", "value1")

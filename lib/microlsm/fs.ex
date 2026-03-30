@@ -19,6 +19,7 @@ defmodule Microlsm.Fs do
   require ODCounter
 
   def init_counters do
+    ODCounter.init_schema(Microlsm, ignore_if_exists: true)
     ODCounter.new(Microlsm, __MODULE__, ignore_if_exists: true)
   end
 

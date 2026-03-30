@@ -1,6 +1,7 @@
 defmodule Microlsm.Disktable do
   @moduledoc false
 
+  alias Microlsm.Disktable
   alias Microlsm.BloomFilter
   alias Microlsm.Fs
   alias Microlsm.SizeException
@@ -508,7 +509,7 @@ defmodule Microlsm.Disktable do
     byte_size(header)
   end
 
-  defp read_header(fd) do
+  def read_header(fd) do
     case Fs.pread(fd, 0, 36) do
       {:ok, <<@magic, magic_readiness :: 32, len::64, max_block_size::64, block_offsets_offset::64>>} ->
         ready =
@@ -539,7 +540,7 @@ defmodule Microlsm.Disktable do
     [<<offset::@offset_size>> | encode_offsets(rest)]
   end
 
-  defp read_footer(fd, block_offsets_offset, readsize) do
+  def read_footer(fd, block_offsets_offset, readsize) do
     {:ok, <<block_count::64, rest::binary>>} = Fs.pread(fd, block_offsets_offset, readsize)
     block_offsets =
       if byte_size(rest) < 8 * block_count do

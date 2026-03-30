@@ -20,7 +20,7 @@ defmodule Microlsm do
 
   defrecordp :global_state,
     # State
-    atomics_ref: nil,
+    atomic_flags: nil,
     memtable1: nil,
     memtable2: nil,
     gentable1: nil,
@@ -275,13 +275,10 @@ defmodule Microlsm do
   """
   @spec read(t(), key()) :: {:ok, value()} | :error
   def read(name, key) do
-    #   :eflambe.apply({Microlsm, :do_read, [name, key]}, output_directory: ~c"flamegraphs")
-    # end
-    # def do_read(name, key) do
     assert_alive!(name)
 
     global_state(
-      atomics_ref: atomics_ref,
+      atomic_flags: atomic_flags,
       memtable1: mt1,
       memtable2: mt2,
       gentable1: gt1,
@@ -289,9 +286,8 @@ defmodule Microlsm do
       descriptor_pool: descriptor_pool
     ) = :persistent_term.get({Microlsm, name})
 
-    AtomicFlags.switch(atomics_ref, :reading) do
-      {memtable, shadow_memtable} = AtomicFlags.order(atomics_ref, :memtables, mt1, mt2)
-      gentable = AtomicFlags.select(atomics_ref, :gentables, gt1, gt2)
+    AtomicFlags.switch(atomic_flags, :reading) do
+      {memtable, shadow_memtable} = AtomicFlags.order(atomic_flags, :memtables, mt1, mt2)
 
       result =
         with(
@@ -299,6 +295,7 @@ defmodule Microlsm do
           :error <- Memtable.read(shadow_memtable, key)
         ) do
           ODCounter.add(Microlsm, name, :memtable_miss)
+          gentable = AtomicFlags.select(atomic_flags, :gentables, gt1, gt2)
           generations = Gentable.to_list(gentable)
           disktable_read(generations, key, descriptor_pool, name)
         else
@@ -314,6 +311,66 @@ defmodule Microlsm do
     else
       :error
     end
+  catch
+    :retry ->
+      read(name, key)
+  end
+
+  @spec mread(t(), Enumerable.t(key)) :: %{key => value()}
+  when key: key()
+  def mread(name, keys) do
+    assert_alive!(name)
+
+    global_state(
+      atomic_flags: atomic_flags,
+      memtable1: mt1,
+      memtable2: mt2,
+      gentable1: gt1,
+      gentable2: gt2,
+      descriptor_pool: descriptor_pool
+    ) = :persistent_term.get({Microlsm, name})
+
+    AtomicFlags.switch(atomic_flags, :reading) do
+      {result, _, _} =
+        Enum.reduce(keys, {%{}, nil, []}, fn key, {acc, gentable, generations} ->
+          {memtable, shadow_memtable} = AtomicFlags.order(atomic_flags, :memtables, mt1, mt2)
+
+          {result, gentable, generations} =
+            with(
+              :error <- Memtable.read(memtable, key),
+              :error <- Memtable.read(shadow_memtable, key)
+            ) do
+              ODCounter.add(Microlsm, name, :memtable_miss)
+
+              {gentable, generations} =
+                case AtomicFlags.select(atomic_flags, :gentables, gt1, gt2) do
+                  ^gentable -> {gentable, generations}
+                  new_gentable -> {new_gentable, Gentable.to_list(new_gentable)}
+                end
+
+              {disktable_read(generations, key, descriptor_pool, name), gentable, generations}
+            else
+              result ->
+                ODCounter.add(Microlsm, name, :memtable_hit)
+                {result, gentable, generations}
+            end
+
+          case result do
+            {:ok, {value}} ->
+              {Map.put(acc, key, value), gentable, generations}
+
+            _ ->
+              {acc, gentable, generations}
+          end
+        end)
+
+      result
+    else
+      %{}
+    end
+  catch
+    :retry ->
+      mread(name, keys)
   end
 
   defp disktable_read([], _key, _descriptor_pool, name) do
@@ -343,13 +400,16 @@ defmodule Microlsm do
               Disktable.find_value(fd, result, key, max_block_size)
             end)
             |> case do
-              {:ok, value} ->
+              {:ok, {:ok, value}} ->
                 ODCounter.add(Microlsm, name, :disktable_hit)
                 {:ok, value}
 
-              {:error, _} ->
+              {:ok, {:error, _}} ->
                 ODCounter.add(Microlsm, name, :disktable_miss)
                 disktable_read(rest, key, descriptor_pool, name)
+
+              {:error, :enoent} ->
+                throw :retry
             end
         end
 
@@ -379,10 +439,18 @@ defmodule Microlsm do
   @spec all(t()) :: Enumerable.t({key(), value()})
   def all(name) do
     assert_alive!(name)
-    global_state(atomics_ref: atomics_ref) = :persistent_term.get({Microlsm, name})
 
-    AtomicFlags.switch(atomics_ref, :reading) do
-      {memtable, shadow_memtable, _gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
+    global_state(
+      atomic_flags: atomic_flags,
+      memtable_read_ahead: memtable_read_ahead,
+      memtable1: mt1,
+      memtable2: mt2,
+      gentable1: gt1,
+      gentable2: gt2
+    ) = :persistent_term.get({Microlsm, name})
+
+    AtomicFlags.switch(atomic_flags, :reading) do
+      {memtable, shadow_memtable} = AtomicFlags.order(atomic_flags, :memtables, mt1, mt2)
 
       memtable_stream = Memtable.stream(memtable, memtable_read_ahead)
       shadow_memtable_stream = Memtable.stream(shadow_memtable, memtable_read_ahead)
@@ -392,8 +460,7 @@ defmodule Microlsm do
       # To avoid funny inconsistencies
       all_memtables_list = Enum.to_list(all_memtables_stream)
 
-      #TODO optimize
-      {_memtable, _shadow_memtable, gentable, _descriptor_pool, _memtable_read_ahead} = get_memtable_and_gentable(name)
+      gentable = AtomicFlags.select(atomic_flags, :gentables, gt1, gt2)
       generations = Gentable.to_list(gentable)
 
       {fds, stream} =
@@ -449,10 +516,18 @@ defmodule Microlsm do
 
   def range_read(name, left_key, right_key) when left_key < right_key do
     assert_alive!(name)
-    global_state(atomics_ref: atomics_ref) = :persistent_term.get({Microlsm, name})
 
-    AtomicFlags.switch(atomics_ref, :reading) do
-      {memtable, shadow_memtable, _gentable, _descriptor_pool, memtable_read_ahead} = get_memtable_and_gentable(name)
+    global_state(
+      atomic_flags: atomic_flags,
+      memtable_read_ahead: memtable_read_ahead,
+      memtable1: mt1,
+      memtable2: mt2,
+      gentable1: gt1,
+      gentable2: gt2
+    ) = :persistent_term.get({Microlsm, name})
+
+    AtomicFlags.switch(atomic_flags, :reading) do
+      {memtable, shadow_memtable} = AtomicFlags.order(atomic_flags, :memtables, mt1, mt2)
       memtable_stream = Memtable.range_read(memtable, left_key, right_key, memtable_read_ahead)
       shadow_memtable_stream = Memtable.range_read(shadow_memtable, left_key, right_key, memtable_read_ahead)
 
@@ -461,7 +536,7 @@ defmodule Microlsm do
       # To avoid funny inconsistencies
       all_memtables_list = Enum.to_list(all_memtables_stream)
 
-      {_memtable, _shadow_memtable, gentable, _descriptor_pool, _memtable_read_ahead} = get_memtable_and_gentable(name)
+      gentable = AtomicFlags.select(atomic_flags, :gentables, gt1, gt2)
       generations = Gentable.to_list(gentable)
 
       {fds, stream} =
@@ -490,7 +565,7 @@ defmodule Microlsm do
   catch
     :retry ->
       ODCounter.add(Microlsm, name, :mread_retries)
-      all(name)
+      range_read(name, left_key, right_key)
   end
 
   defp finalize_read_stream(enumerable, fds) do
@@ -589,7 +664,7 @@ defmodule Microlsm do
   end
 
   defp create_global_state(memtable_read_ahead) do
-    atomics_ref = AtomicFlags.new()
+    atomic_flags = AtomicFlags.new()
     memtable = Memtable.new()
     shadow_memtable = Memtable.new()
     gentable = Gentable.new()
@@ -597,7 +672,7 @@ defmodule Microlsm do
     descriptor_pool = DescriptorPool.new()
 
     global_state(
-      atomics_ref: atomics_ref,
+      atomic_flags: atomic_flags,
       memtable1: memtable,
       memtable2: shadow_memtable,
       gentable1: gentable,
@@ -619,10 +694,12 @@ defmodule Microlsm do
       ODCounter.reset(Microlsm, name)
     end
 
+    # Data dir setup
     data_dir = Path.expand(Keyword.fetch!(opts, :data_dir))
     check_or_write_lock(data_dir)
     disktable_dir = Path.join(data_dir, "disktables")
 
+    # Options handling
     allow_overflow = Keyword.get(opts, :allow_overflow, false)
     block_size_threshold = Keyword.get(opts, :block_size_threshold, 4 * 1024)
     memtable_read_ahead = Keyword.get(opts, :memtable_read_ahead, 1000)
@@ -806,7 +883,7 @@ defmodule Microlsm do
       end
 
     global_state(
-      atomics_ref: atomics_ref,
+      atomic_flags: atomic_flags,
       memtable1: mt1,
       memtable2: mt2,
       gentable1: gt1,
@@ -814,8 +891,8 @@ defmodule Microlsm do
       descriptor_pool: descriptor_pool
     ) = :persistent_term.get({Microlsm, name})
 
-    :enabled = AtomicFlags.select(atomics_ref, :reading, :enabled, :disabled)
-    AtomicFlags.swap(atomics_ref, :reading)
+    :enabled = AtomicFlags.select(atomic_flags, :reading, :enabled, :disabled)
+    AtomicFlags.swap(atomic_flags, :reading)
 
     Memtable.clear(mt1)
     Memtable.clear(mt2)
@@ -828,8 +905,8 @@ defmodule Microlsm do
     Wal.truncate(working_wal)
     Wal.truncate(shadow_wal)
 
-    :disabled = AtomicFlags.select(atomics_ref, :reading, :enabled, :disabled)
-    AtomicFlags.swap(atomics_ref, :reading)
+    :disabled = AtomicFlags.select(atomic_flags, :reading, :enabled, :disabled)
+    AtomicFlags.swap(atomic_flags, :reading)
 
     :erlang.garbage_collect()
     {:reply, :ok, state}
@@ -1206,18 +1283,18 @@ defmodule Microlsm do
   end
 
   defp swap_memtables(name) do
-    global_state(atomics_ref: atomics_ref) = :persistent_term.get({Microlsm, name})
-    AtomicFlags.swap(atomics_ref, :memtables)
+    global_state(atomic_flags: atomic_flags) = :persistent_term.get({Microlsm, name})
+    AtomicFlags.swap(atomic_flags, :memtables)
   end
 
   defp swap_gentables(name) do
-    global_state(atomics_ref: atomics_ref) = :persistent_term.get({Microlsm, name})
-    AtomicFlags.swap(atomics_ref, :gentables)
+    global_state(atomic_flags: atomic_flags) = :persistent_term.get({Microlsm, name})
+    AtomicFlags.swap(atomic_flags, :gentables)
   end
 
   defp get_memtable_and_gentable(name) do
     global_state(
-      atomics_ref: atomics_ref,
+      atomic_flags: atomic_flags,
       memtable_read_ahead: memtable_read_ahead,
       memtable1: mt1,
       memtable2: mt2,
@@ -1226,13 +1303,13 @@ defmodule Microlsm do
       descriptor_pool: descriptor_pool
     ) = :persistent_term.get({Microlsm, name})
 
-    {memtable, shadow_memtable} = AtomicFlags.order(atomics_ref, :memtables, mt1, mt2)
-    gentable = AtomicFlags.select(atomics_ref, :gentables, gt1, gt2)
+    {memtable, shadow_memtable} = AtomicFlags.order(atomic_flags, :memtables, mt1, mt2)
+    gentable = AtomicFlags.select(atomic_flags, :gentables, gt1, gt2)
     {memtable, shadow_memtable, gentable, descriptor_pool, memtable_read_ahead}
   end
 
   defp get_shadow_gentable(name) do
-    global_state(atomics_ref: atomics_ref, gentable1: gt1, gentable2: gt2) = :persistent_term.get({Microlsm, name})
-    AtomicFlags.select(atomics_ref, :gentables, gt2, gt1)
+    global_state(atomic_flags: atomic_flags, gentable1: gt1, gentable2: gt2) = :persistent_term.get({Microlsm, name})
+    AtomicFlags.select(atomic_flags, :gentables, gt2, gt1)
   end
 end

@@ -38,6 +38,15 @@ defmodule Microlsm.FuzzTest do
       end
     end
 
+    def mread(name, keys) do
+      Enum.reduce(keys, %{}, fn key, acc ->
+        case :ets.lookup(name, key) do
+          [{key, value}] -> Map.put(acc, key, value)
+          _ -> acc
+        end
+      end)
+    end
+
     def all(name) do
       :ets.tab2list(name)
     end
@@ -159,7 +168,7 @@ defmodule Microlsm.FuzzTest do
         reference:  #{inspect(ReferenceStore.read(name, key))}
         value:      #{inspect(Microlsm.read(name, key))}
         location:   #{inspect(Microlsm.location(name, key))}
-        operations: #{inspect(filter_ops(ops, key))}
+        operations: #{inspect(filter_ops(ops, key, 10))}
       """
     end
 
@@ -170,7 +179,7 @@ defmodule Microlsm.FuzzTest do
         reference:  #{inspect(ReferenceStore.read(name, key))}
         value:      #{inspect(Microlsm.read(name, key))}
         location:   #{inspect(Microlsm.location(name, key))}
-        operations: #{inspect(filter_ops(ops, key))}
+        operations: #{inspect(filter_ops(ops, key, 10))}
       """
     end
 
@@ -181,7 +190,7 @@ defmodule Microlsm.FuzzTest do
         reference:  #{inspect(ReferenceStore.read(name, key))}
         value:      #{inspect(Microlsm.read(name, key))}
         location:   #{inspect(Microlsm.location(name, key))}
-        operations: #{inspect(filter_ops(ops, key))}
+        operations: #{inspect(filter_ops(ops, key, 10))}
       """
     end
 
@@ -195,34 +204,38 @@ defmodule Microlsm.FuzzTest do
     end
   end
 
-  defp filter_ops([[:write, _, key, v] | ops], key) do
-    [{:write, v} | filter_ops(ops, key)]
+  defp filter_ops(_ops, _key, 0) do
+    []
   end
 
-  defp filter_ops([[:delete, _, key] | ops], key) do
-    [:delete | filter_ops(ops, key)]
+  defp filter_ops([[:write, _, key, v] | ops], key, len) do
+    [{:write, v} | filter_ops(ops, key, len - 1)]
   end
 
-  defp filter_ops([[:batch, _, batch] | ops], key) do
+  defp filter_ops([[:delete, _, key] | ops], key, len) do
+    [:delete | filter_ops(ops, key, len - 1)]
+  end
+
+  defp filter_ops([[:batch, _, batch] | ops], key, len) do
     case filter_batch(batch, key) do
-      [] -> filter_ops(ops, key)
-      batch -> [{:batch, batch} | filter_ops(ops, key)]
+      [] -> filter_ops(ops, key, len)
+      batch -> [{:batch, batch} | filter_ops(ops, key, len - 1)]
     end
   end
 
-  defp filter_ops([:kill | ops], key) do
-    ops = filter_ops(ops, key)
+  defp filter_ops([:kill | ops], key, len) do
+    ops = filter_ops(ops, key, len - 1)
     case ops do
       [:kill | _] -> ops
       ops -> [:kill | ops]
     end
   end
 
-  defp filter_ops([_ | ops], key) do
-    filter_ops(ops, key)
+  defp filter_ops([_ | ops], key, len) do
+    filter_ops(ops, key, len)
   end
 
-  defp filter_ops([], _key) do
+  defp filter_ops([], _key, _len) do
     []
   end
 
@@ -341,7 +354,7 @@ defmodule Microlsm.FuzzTest do
       Microlsm.start_link(
         name: name,
         data_dir: data_dir,
-        threshold: 1024,
+        threshold: 1024
       )
 
     ReferenceStore.new(name)
@@ -364,6 +377,8 @@ defmodule Microlsm.FuzzTest do
       ]
 
     IO.inspect data_dir
+
+    start_watcher(name)
 
     ops =
       stream
@@ -398,6 +413,13 @@ defmodule Microlsm.FuzzTest do
             reference = Enum.to_list(apply(ReferenceStore, op, args))
             microlsm = Enum.to_list(apply(Microlsm, op, args))
 
+            keys =
+              for {key, _} <- reference do
+                key
+              end
+
+            assert ReferenceStore.mread(name, keys) == Microlsm.mread(name, keys)
+
             with [_, _ | _] = diff <- List.myers_difference(reference, microlsm) do
               diff_keys =
                 diff
@@ -413,7 +435,7 @@ defmodule Microlsm.FuzzTest do
                 IO.inspect Enum.find(reference, &match?({^key, _}, &1)), label: :reference
                 IO.inspect Enum.find(microlsm, &match?({^key, _}, &1)), label: :microlsm
                 IO.inspect Enum.find(apply(Microlsm, op, args), &match?({^key, _}, &1)), label: :microlsm_retry
-                IO.inspect filter_ops(acc, key), label: :ops
+                IO.inspect filter_ops(acc, key, 5), label: :ops
                 IO.inspect loc, label: :location
                 IO.puts ""
               end
@@ -430,5 +452,15 @@ defmodule Microlsm.FuzzTest do
 
     check(name, ops)
     Microlsm.Stats.print(name)
+  end
+
+  defp start_watcher(name) do
+    owner = self()
+    spawn(fn -> watcher_loop(owner, name) end)
+  end
+
+  defp watcher_loop(owner, name) do
+    Process.sleep(5_000)
+    watcher_loop(owner, name)
   end
 end
