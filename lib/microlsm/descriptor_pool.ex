@@ -66,10 +66,10 @@ defmodule Microlsm.DescriptorPool do
     end
   else
     @spec add(pool(), filename :: String.t(), pos_integer()) :: t()
-    def add(_pool, filename, 1) do
-      filename_ref = :erlang.unique_integer()
-      {filename_ref, filename}
-    end
+    # def add(_pool, filename, 1) do
+    #   filename_ref = :erlang.unique_integer()
+    #   {filename_ref, filename}
+    # end
 
     def add(_pool, filename, count) do
       filename_ref = :erlang.unique_integer()

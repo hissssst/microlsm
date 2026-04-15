@@ -87,6 +87,32 @@ defmodule MicrolsmTest do
     end
   end
 
+  test "all and all2", %{name: name, data_dir: data_dir} do
+    {:ok, _pid} = Microlsm.start_link(name: name, data_dir: data_dir, wal_length_threshold: 9)
+    batch = for i <- 1..5, do: {:write, i, i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    batch = for i <- 6..10, do: {:write, i, i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    batch = for i <- 11..15, do: {:write, i, i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    batch = for i <- 1..5, do: {:write, i, -i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    batch = for i <- 6..10, do: {:write, i, -i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    batch = for i <- 11..15, do: {:write, i, -i}
+    assert :ok = Microlsm.batch(name, batch)
+
+    Process.sleep 300
+
+    assert Enum.to_list(Enum.map(1..15, &{&1, -&1})) == Enum.to_list(Microlsm.all(name))
+    assert Enum.to_list(Enum.map(1..15, &{&1, -&1})) == Enum.to_list(Microlsm.all2(name))
+  end
+
   test "mread", %{name: name, data_dir: data_dir} do
     {:ok, _pid} = Microlsm.start_link(name: name, data_dir: data_dir, wal_length_threshold: 9)
     batch = for i <- 1..5, do: {:write, i, i}

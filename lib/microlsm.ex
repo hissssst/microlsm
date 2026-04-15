@@ -368,9 +368,6 @@ defmodule Microlsm do
     else
       %{}
     end
-  catch
-    :retry ->
-      mread(name, keys)
   end
 
   defp disktable_read([], _key, _descriptor_pool, name) do
@@ -477,6 +474,46 @@ defmodule Microlsm do
         end)
 
       finalize_read_stream(stream, fds)
+    else
+      []
+    end
+  catch
+    :retry ->
+      ODCounter.add(Microlsm, name, :mread_retries)
+      all(name)
+  end
+
+  def all2(name) do
+    assert_alive!(name)
+
+    global_state(
+      atomic_flags: atomic_flags,
+      memtable1: mt1,
+      memtable2: mt2,
+      gentable1: gt1,
+      gentable2: gt2
+    ) = :persistent_term.get({Microlsm, name})
+
+    AtomicFlags.switch(atomic_flags, :reading) do
+      {memtable, shadow_memtable} = AtomicFlags.order(atomic_flags, :memtables, mt1, mt2)
+
+      memtable_list = Memtable.all(memtable)
+      shadow_memtable_list = Memtable.all(shadow_memtable)
+
+      gentable = AtomicFlags.select(atomic_flags, :gentables, gt1, gt2)
+      generations = Gentable.to_list(gentable)
+
+      disktables = Enum.map(generations, fn {_, {dt}} -> dt end)
+      merge_inputs =
+        [
+          {:list, -2, memtable_list},
+          {:list, -1, shadow_memtable_list}
+          | disktables
+        ]
+
+      stream = Microlsm.Merger.stream_merge(merge_inputs)
+
+      finalize_read_stream(stream, [])
     else
       []
     end
@@ -1172,7 +1209,6 @@ defmodule Microlsm do
       _ ->
         last_id = last_id + 1
         write_full_filename = filename_for_generation(disktable_dir, generation, last_id)
-        {:ok, fd} = Fs.open(write_full_filename, [:write, :read])
 
         {index, bloom_filter, max_block_size, table_length} =
           case generations do
@@ -1183,9 +1219,8 @@ defmodule Microlsm do
             _ ->
               stream
           end
-          |> Disktable.write_stream(fd, total_length, block_size_threshold)
+          |> Disktable.write_stream(write_full_filename, total_length, block_size_threshold)
 
-        Fs.close(fd)
         backtracked_generation = backtrack_generation(lengths, table_length, generation)
 
         {full_filename, last_id} =

@@ -80,7 +80,6 @@ defmodule Microlsm.FuzzTest do
     end
   end
 
-  @tag skip: true
   test "Fuzz multi key", %{name: name, data_dir: data_dir} do
     test_length = 128 * 1024
     threshold = 1024
@@ -88,6 +87,7 @@ defmodule Microlsm.FuzzTest do
 
     {:ok, _pid} =
       Microlsm.start_link(
+        allow_overflow: true,
         name: name,
         data_dir: data_dir,
         threshold: threshold
@@ -102,16 +102,19 @@ defmodule Microlsm.FuzzTest do
       frequency [
         {kill_every, fixed_list([:write, name, key, value])},
         {kill_every, fixed_list([:delete, name, key])},
-        {kill_every, fixed_list([:batch, name, batch(key, value)])},
-        {3, :kill}
+        # {kill_every, fixed_list([:batch, name, batch(key, value)])},
+        # {2, :kill}
       ]
 
     import StreamData, only: []
+
+    # start_watcher(name)
 
     ops =
       stream
       |> Stream.take(test_length)
       |> Enum.reduce([], fn entry, acc ->
+        IO.write "."
         case entry do
           [op | args] ->
             apply(ReferenceStore, op, args)
@@ -255,7 +258,6 @@ defmodule Microlsm.FuzzTest do
     []
   end
 
-  # @tag skip: true
   test "Fuzz single key", %{name: name, data_dir: data_dir} do
     test_length = 128 * 1024
     threshold = 1024
@@ -378,8 +380,6 @@ defmodule Microlsm.FuzzTest do
 
     IO.inspect data_dir
 
-    start_watcher(name)
-
     ops =
       stream
       |> Stream.take(test_length)
@@ -460,7 +460,15 @@ defmodule Microlsm.FuzzTest do
   end
 
   defp watcher_loop(owner, name) do
-    Process.sleep(5_000)
+    pid = Process.whereis(name)
+    IO.inspect Process.info(pid, :current_stacktrace)
+    {:links, links} = Process.info(pid, :links)
+
+    for link <- links, link != owner do
+      IO.inspect Process.info(link, :current_stacktrace), label: inspect(link)
+    end
+
+    Process.sleep(500)
     watcher_loop(owner, name)
   end
 end

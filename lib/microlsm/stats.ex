@@ -1,14 +1,14 @@
 defmodule Microlsm.Stats do
   @moduledoc false
 
-  defmacrop floorwrap(code) do
+  defmacrop floorwrap(code, undefined \\ "undefined") do
     quote do
       try do
         unquote(code)
       else
         result -> Float.floor(result, 3)
       rescue
-        _ -> "undefined"
+        _ -> unquote(undefined)
       end
     end
   end
@@ -18,8 +18,8 @@ defmodule Microlsm.Stats do
 
     IO.puts "\nStats"
 
-    memtable_miss_rate = floorwrap(100 * ((stats.memtable_miss - stats.complete_miss) / (stats.memtable_miss + stats.memtable_hit)))
-    IO.puts "Memtable miss rate              #{memtable_miss_rate} %"
+    memtable_hit_rate = floorwrap(100 * (stats.memtable_hit / (stats.memtable_hit + stats.memtable_miss - stats.complete_miss)), 0)
+    IO.puts "Memtable hit rate               #{memtable_hit_rate} % (of the queries which hit anything)"
 
     read_hit_rate = floorwrap((stats.disktable_hit + stats.disktable_miss) / (stats.memtable_miss - stats.complete_miss))
     IO.puts "Reads per disk hit              #{read_hit_rate} times"

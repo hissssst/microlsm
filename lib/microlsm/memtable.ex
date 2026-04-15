@@ -68,6 +68,10 @@ defmodule Microlsm.Memtable do
     :ok
   end
 
+  def all(memtable) do
+    :ets.tab2list(memtable)
+  end
+
   defp do_stream(memtable, selector, read_ahead) do
     Stream.resource(
       fn -> :ets.select(memtable, selector, read_ahead) end,

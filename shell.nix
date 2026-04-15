@@ -1,7 +1,7 @@
 { pkgs ? (import <nixpkgs> { }), ... }:
 with pkgs;
 let
-  otp = beam.packages.erlang_27;
+  otp = beam.packages.erlang_28;
   elixir = otp.elixir_1_19;
 in
 pkgs.mkShell {

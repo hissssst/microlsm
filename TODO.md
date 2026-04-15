@@ -1,35 +1,56 @@
-## TODO
+# TODO
 
-[ ] Optimize retries in mread and stuff
-    FYI: Retries happen when compaction starts and finishes during the operation
-    (operaion meaning mread or something).
+## Big
+
+[ ] Implement overlow with storing disktables in gen0, without merging
+
+[ ] Fallback for big key and big value
 
 [ ] README
 
 [ ] Docs
 
-[ ] Improve descriptor pool cleanup process to load the system less
-
-[ ] Make a search index of disktable ranges.
-    In theory it should make the search for disktable a bit faster
-    But in practice I doubt it, cause lineary checking all disktables
-    is not much slower
+[ ] Implement compare_and_change
 
 [ ] Improve restart to not reset the persistent_term
     Hard to do, because state hanging around may cause problems with concurrent reads
 
-[ ] Fallback for big key and big value
+[ ] Move term_to_iovec to caller
+    Needs a benchmark
+
+## Small
+
+[ ] Implement proper condition of compaction happening
+    instead of checking if the gentable changed
+    in mread and range_read scenarios
+
+[ ] Improve descriptor pool cleanup process to load the system less
+
+[ ] Compare with existing value on write
+    to not store writes which do not change the value
 
 [ ] Implement generation backtracking based on table size, not length
 
-[ ] Backtracking may produce funny results with allow_overflow. Investigate
+[ ] Implement wal threshold based on size, not length
 
-[ ] Implement overlow with storing disktables in gen0, without merging
+[ ] Backtracking may produce funny results with allow_overflow. Investigate
 
 [ ] Investigate non-log2 structure of SST heirarchy
     That means some logN
 
-[ ] Optimize find_block to always use num version of function
+[ ] Optimize retries in mread, read and range_reads, etc.
+    FYI: Retries happen when compaction starts and finishes during the operation
+    (operaion meaning mread or something).
+
+[ ] Maybe use descriptor pool in range_reads?
+
+[ ] Investigate a situation when one read creates a descriptor cell
+    right after the descriptor pool state was removed
+
+[?] Make a search index of disktable ranges.
+    In theory it should make the search for disktable a bit faster
+    But in practice I doubt it, cause lineary checking all disktables
+    is not much slower
 
 ## WONT DO
 
@@ -46,6 +67,7 @@
 
 ## DONE
 
+[x] Optimize find_block to always use num version of function
 [x] Implement proper mread
 [x] Test range reads
 [x] Backtracking generation for overwrite-only scenarios

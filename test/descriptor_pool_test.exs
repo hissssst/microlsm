@@ -7,6 +7,7 @@ defmodule Microlsm.DescriptorPoolTest do
     count = Map.get(tags, :count, 10)
     pool = DescriptorPool.new()
     state = DescriptorPool.add(pool, __ENV__.file, count)
+    Microlsm.Fs.init_counters()
 
     {:ok, pool: pool, state: state}
   end
@@ -18,7 +19,7 @@ defmodule Microlsm.DescriptorPoolTest do
         Fs.pread(fd, 0, 9)
       end)
 
-    assert result == {:ok, "defmodule"}
+    assert result == {:ok, {:ok, "defmodule"}}
   end
 
   @tag count: 2
@@ -43,8 +44,8 @@ defmodule Microlsm.DescriptorPoolTest do
         Fs.pread(fd, 0, 9)
       end)
 
-    assert result == {:ok, "defmodule"}
+    assert result == {:ok, {:ok, "defmodule"}}
     send(cell, :finish)
-    assert_receive {:result, :some_result}
+    assert_receive {:result, {:ok, :some_result}}
   end
 end
