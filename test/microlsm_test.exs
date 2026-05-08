@@ -19,8 +19,11 @@ defmodule MicrolsmTest do
     refute_receive {:EXIT, _, _}
 
     Process.flag(:trap_exit, true)
-    assert {:error, {%RuntimeError{message: message}, _}} = Microlsm.start_link(name: :other_name, data_dir: data_dir)
-    assert message == "Table is in use by #{inspect pid}"
+
+    assert {:error, {%RuntimeError{message: message}, _}} =
+             Microlsm.start_link(name: :other_name, data_dir: data_dir)
+
+    assert message == "Table is in use by #{inspect(pid)}"
 
     Process.exit(pid, :kill)
     refute Process.alive?(pid)
@@ -78,7 +81,7 @@ defmodule MicrolsmTest do
     batch = for i <- 11..15, do: {:write, i, i}
     assert :ok = Microlsm.batch(name, batch)
 
-    Process.sleep 300
+    Process.sleep(300)
 
     for i <- 0..20, j <- i..20 do
       microlsm = Enum.to_list(Microlsm.range_read(name, i, j))
@@ -107,7 +110,7 @@ defmodule MicrolsmTest do
     batch = for i <- 11..15, do: {:write, i, -i}
     assert :ok = Microlsm.batch(name, batch)
 
-    Process.sleep 300
+    Process.sleep(300)
 
     assert Enum.to_list(Enum.map(1..15, &{&1, -&1})) == Enum.to_list(Microlsm.all(name))
     assert Enum.to_list(Enum.map(1..15, &{&1, -&1})) == Enum.to_list(Microlsm.all2(name))
@@ -124,7 +127,7 @@ defmodule MicrolsmTest do
     batch = for i <- 11..15, do: {:write, i, i}
     assert :ok = Microlsm.batch(name, batch)
 
-    Process.sleep 300
+    Process.sleep(300)
 
     assert %{1 => 1, 2 => 2} = Microlsm.mread(name, [0, 1, 2, 1234])
   end
@@ -144,7 +147,8 @@ defmodule MicrolsmTest do
     assert {:ok, "value2"} = Microlsm.read(name, "key")
   end
 
-  @tag timeout: :infinity #, skip: true
+  # , skip: true
+  @tag timeout: :infinity
   test "Writes, rewrites and deletes many times", %{name: name, data_dir: data_dir} do
     Microlsm.start_link(
       name: name,
@@ -184,7 +188,7 @@ defmodule MicrolsmTest do
           Microlsm.read(name, i)
         rescue
           e ->
-            IO.inspect i
+            IO.inspect(i)
             reraise e, __STACKTRACE__
         end
       end
@@ -244,6 +248,6 @@ defmodule MicrolsmTest do
       end
 
     Microlsm.batch(name, batch)
-    assert Enum.to_list(Microlsm.all(name)) == (for i <- 1..1024, do: {i, i})
+    assert Enum.to_list(Microlsm.all(name)) == for(i <- 1..1024, do: {i, i})
   end
 end

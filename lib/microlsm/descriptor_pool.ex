@@ -58,6 +58,7 @@ defmodule Microlsm.DescriptorPool do
 
     def checkout(_pool, filename, func, _timeout \\ nil) do
       {:ok, fd} = Fs.open(filename, [:read])
+
       try do
         func.(fd)
       after
@@ -87,8 +88,8 @@ defmodule Microlsm.DescriptorPool do
       :ok
     end
 
-    @spec checkout(pool(), t(), (tuple() -> result), timeout()) :: {:ok, result}
-    when result: term()
+    @spec checkout(pool(), t(), (tuple() -> result), timeout()) :: {:ok, result} | {:error, :enoent}
+          when result: term()
     def checkout(pool, {filename_ref, atomics_ref, count, filename}, func, timeout \\ 5_000) do
       {table, sup} = pool
 
@@ -220,11 +221,13 @@ defmodule Microlsm.DescriptorPool do
       false ->
         # Ex2ms.fun do {{filename_ref, i}, :free, cell} -> {{filename_ref, i}, self(), cell} end
         ms = [{{{filename_ref, index}, :free, :"$1"}, [], [{{{{filename_ref, index}}, self(), :"$1"}}]}]
+
         case :ets.select_replace(table, ms) do
           0 ->
             next_value = :atomics.add_get(atomics_ref, 1, 1)
             next_index = rem(next_value, count)
             dlog(:dp_cnt)
+
             do_checkout_cell(sup, table, filename_ref, filename, atomics_ref, count, start_index, next_index)
 
           1 ->

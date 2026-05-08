@@ -5,8 +5,8 @@ defmodule Microlsm.AfdTest do
   setup_all do: Microlsm.Fs.init_counters()
 
   setup do
-    i = Integer.to_string :erlang.unique_integer [:positive]
-    filename = Path.join [System.tmp_dir!(), "afs_test_#{i}"]
+    i = Integer.to_string(:erlang.unique_integer([:positive]))
+    filename = Path.join([System.tmp_dir!(), "afs_test_#{i}"])
     {:ok, filename: filename}
   end
 

@@ -27,16 +27,16 @@ defmodule Microlsm.Gentable do
     max_block_size: nil
 
   @type disktable :: {
-    :disktable,
-    bloom_filter :: BloomFilter.t(),
-    descriptor_pool_state :: DescriptorPool.t(),
-    filename :: Path.t(),
-    generation :: generation_number(),
-    id :: term(),
-    index :: Disktable.index(),
-    length :: pos_integer(),
-    max_block_size :: pos_integer()
-  }
+          :disktable,
+          bloom_filter :: BloomFilter.t(),
+          descriptor_pool_state :: DescriptorPool.t(),
+          filename :: Path.t(),
+          generation :: generation_number(),
+          id :: term(),
+          index :: Disktable.index(),
+          length :: pos_integer(),
+          max_block_size :: pos_integer()
+        }
 
   @spec new() :: table()
   def new do
@@ -117,6 +117,7 @@ defmodule Microlsm.Gentable do
 
           :higher ->
             disktable = disktable(index: index) = element(r, disktables)
+
             case Disktable.check_bounds(index, key) do
               result when is_inbound(result) ->
                 disktable

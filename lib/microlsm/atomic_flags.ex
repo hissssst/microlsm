@@ -5,7 +5,7 @@ defmodule Microlsm.AtomicFlags do
   @schema [
     :memtables,
     :gentables,
-    :reading,
+    :reading
   ]
 
   indexed_schema = Enum.with_index(@schema, 1)
@@ -29,10 +29,11 @@ defmodule Microlsm.AtomicFlags do
     for i <- 1..unquote(length(@schema)) do
       :atomics.put(atomics_ref, i, 0)
     end
+
     :ok
   end
 
-  defmacro switch(atomics_ref, key, [do: do_block, else: else_block]) do
+  defmacro switch(atomics_ref, key, do: do_block, else: else_block) do
     index =
       if is_atom(key) do
         indexof(key)
@@ -49,7 +50,7 @@ defmodule Microlsm.AtomicFlags do
   end
 
   @spec select(t(), key(), value0, value1) :: value0 | value1
-  when value0: term(), value1: term()
+        when value0: term(), value1: term()
   def select(atomics_ref, key, v0, v1) do
     case :atomics.get(atomics_ref, indexof(key)) do
       0 -> v0
@@ -58,7 +59,7 @@ defmodule Microlsm.AtomicFlags do
   end
 
   @spec order(t(), key(), value0, value1) :: {value0, value1} | {value1, value0}
-  when value0: term(), value1: term()
+        when value0: term(), value1: term()
   def order(atomics_ref, key, v0, v1) do
     case :atomics.get(atomics_ref, indexof(key)) do
       0 -> {v0, v1}

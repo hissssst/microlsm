@@ -20,7 +20,7 @@ defmodule Microlsm.Debug do
           exception ->
             queue = Process.get(:__debug_queue, {[], []})
             log = Enum.reject(:queue.to_list(queue), &is_nil/1)
-            IO.inspect log, label: inspect(self())
+            IO.inspect(log, label: inspect(self()))
             reraise exception, __STACKTRACE__
         end
       end
@@ -29,7 +29,7 @@ defmodule Microlsm.Debug do
     def do_dlog(msg) do
       queue =
         with nil <- Process.get(:__debug_queue) do
-          :queue.from_list List.duplicate(nil, @debug_queue_size)
+          :queue.from_list(List.duplicate(nil, @debug_queue_size))
         end
 
       queue = :queue.drop(queue)
@@ -40,7 +40,7 @@ defmodule Microlsm.Debug do
 
     def get_dlog(pid) do
       {_, dict} = Process.info(pid, :dictionary)
-      :queue.to_list Keyword.get(dict, :__debug_queue, {[], []})
+      :queue.to_list(Keyword.get(dict, :__debug_queue, {[], []}))
     end
   else
     def debug?, do: false
@@ -57,14 +57,14 @@ defmodule Microlsm.Debug do
       {:ok, fd} ->
         with {:ready, _length, _max_block_size, block_offsets_offset} <- IO.inspect(read_header(fd), label: :header) do
           with {_block_count, block_offsets} <- IO.inspect(read_footer(fd, block_offsets_offset, 4096), label: :footer) do
-            IO.inspect load(fd), label: :loaded
-            IO.inspect read_blocks(fd, block_offsets, block_offsets_offset), label: :blocks, limit: :infinity
+            IO.inspect(load(fd), label: :loaded)
+            IO.inspect(read_blocks(fd, block_offsets, block_offsets_offset), label: :blocks, limit: :infinity)
             :ok
           end
         end
 
       other ->
-        IO.inspect other, label: :on_open
+        IO.inspect(other, label: :on_open)
         :ok
     end
   end
@@ -85,6 +85,7 @@ defmodule Microlsm.Debug do
 
   defp read_chunk(chunk) do
     import :erlang, only: [binary_to_term: 1]
+
     case chunk do
       <<
         keysize::32,

@@ -306,7 +306,6 @@ defmodule Microlsm.Disktable do
         {afd, [], 0, offset, nil, nil, [], 0, bloom_filter_builder, 0},
         fn {key, encoded_value}, {afd, block, block_size, offset, first_key, _last_key, key_to_blocks, len, bloom_filter_builder, max_block_size} ->
           len = len + 1
-
           bloom_filter_builder = BloomFilter.add(bloom_filter_builder, key)
 
           encoded_key = term_to_iovec(key)
@@ -317,6 +316,7 @@ defmodule Microlsm.Disktable do
           SizeException.check!(value_size, unquote(1 <<< @valuesize_size))
 
           entry = [<<key_size::@keysize_size, value_size::@valuesize_size>>, encoded_key, encoded_value]
+
           entry_size = key_size + value_size + @pairprefix_size
           block_and_entry_size = block_size + entry_size
 
@@ -356,7 +356,6 @@ defmodule Microlsm.Disktable do
           last_encoded_key = term_to_iovec(last_key)
           last_pair_size = iolist_size(last_encoded_key) + iolist_size(last_encoded_value) + @pairprefix_size
           last_block = {last_key, offset - last_pair_size}
-
           [last_block | key_to_blocks]
       end
       |> :lists.reverse()
@@ -539,15 +538,15 @@ defmodule Microlsm.Disktable do
     magic_readiness =
       case ready do
         :not_ready -> 0b0000_0011_0011_0011_0011_0011_0011_0000
-        :ready ->     0b1111_1100_1100_1100_1100_1100_1100_1111
+        :ready     -> 0b1111_1100_1100_1100_1100_1100_1100_1111
       end
 
-    <<@magic, magic_readiness :: 32, len::64, max_block_size::64, block_offsets_offset::64>>
+    <<@magic, magic_readiness::32, len::64, max_block_size::64, block_offsets_offset::64>>
   end
 
   def read_header(fd) do
     case Fs.pread(fd, 0, 36) do
-      {:ok, <<@magic, magic_readiness :: 32, len::64, max_block_size::64, block_offsets_offset::64>>} ->
+      {:ok, <<@magic, magic_readiness::32, len::64, max_block_size::64, block_offsets_offset::64>>} ->
         ready =
           case magic_readiness do
             0b0000_0011_0011_0011_0011_0011_0011_0000 -> :not_ready
@@ -557,7 +556,7 @@ defmodule Microlsm.Disktable do
         {ready, len, max_block_size, block_offsets_offset}
 
       _other ->
-        #TODO implement logging
+        # TODO implement logging
         :broken
     end
   end
@@ -584,6 +583,7 @@ defmodule Microlsm.Disktable do
 
   def read_footer(fd, block_offsets_offset, readsize) do
     {:ok, <<block_count::64, rest::binary>>} = Fs.pread(fd, block_offsets_offset, readsize)
+
     block_offsets =
       if byte_size(rest) < 8 * block_count do
         {:ok, block_offsets} = Fs.pread(fd, block_offsets_offset + 8, 8 * block_count)

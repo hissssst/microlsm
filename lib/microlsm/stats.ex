@@ -41,6 +41,6 @@ defmodule Microlsm.Stats do
         [name, value, ?\n]
       end
 
-    IO.puts table
+    IO.puts(table)
   end
 end

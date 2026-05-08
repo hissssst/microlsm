@@ -11,16 +11,16 @@ defmodule Microlsm.WalTest do
     import StreamData
 
     x =
-      one_of [
+      one_of([
         string(:ascii, max_length: 16),
         integer()
-      ]
+      ])
 
     value =
-      one_of [
+      one_of([
         constant({}),
         tuple({x})
-      ]
+      ])
 
     stream = tuple({x, value})
 

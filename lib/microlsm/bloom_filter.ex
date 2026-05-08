@@ -3,7 +3,7 @@ defmodule Microlsm.BloomFilter do
 
   import Bitwise, only: [|||: 2, <<<: 2, &&&: 2, >>>: 2]
 
-  @bitsize_threshold 4194239
+  @bitsize_threshold 4_194_239
   # Because 1 <<< 4194240 raises an error
 
   ## Stream creation
@@ -93,6 +93,7 @@ defmodule Microlsm.BloomFilter do
 
   defp align_bytesize(bitsize) do
     bytesize = bitsize >>> 3
+
     case bitsize &&& 0b111 do
       0 ->
         bytesize

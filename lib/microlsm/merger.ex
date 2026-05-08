@@ -1,4 +1,6 @@
 defmodule Microlsm.Merger do
+  @moduledoc false
+
   import Microlsm.Gentable, only: [disktable: 1]
   import :erlang, only: [element: 2]
   alias Microlsm.Disktable
@@ -6,13 +8,11 @@ defmodule Microlsm.Merger do
 
   @compile {:inline, pop: 1, next: 1, place: 2, prepare: 1}
 
-  defguardp is_gen(x) when is_integer(x) and x > unquote(- (2 ** 30)) and x < unquote(2 ** 30)
+  defguardp is_gen(x) when is_integer(x) and x > unquote(-(2 ** 30)) and x < unquote(2 ** 30)
 
-  def stream_merge(disktables) do
-    fn acc, fun ->
-      states = prepare(disktables)
-      do_stream(states, acc, fun)
-    end
+  def merged_stream(disktables) do
+    states = prepare(disktables)
+    fn acc, fun -> do_stream(states, acc, fun) end
   end
 
   defp do_stream(states, {:suspend, iacc}, fun) do
@@ -42,18 +42,35 @@ defmodule Microlsm.Merger do
       {:list, generation, list} ->
         pop({nil, generation, list, :list})
 
-      disktable(filename: filename, index: index, generation: generation) ->
-        {:ok, afd} = Afs.open(filename, [:read])
-        {_, offset} = element(1, index)
-        {_, next_offset} = element(2, index)
+      # Single value index
+      disktable(filename: filename, index: {{_key, offset}}, generation: generation) ->
+        case Afs.open(filename, [:read]) do
+          {:ok, afd} ->
+            {kv, afd} = Disktable.aread_kv(afd, offset, 4096)
+            {kv, generation, <<>>, {afd, nil, {}, 1, 0}}
 
-        {pread_ref, afd} = Afs.pread(afd, offset, next_offset - offset)
-        pop({nil, generation, <<>>, {afd, pread_ref, index, 1, tuple_size(index)}})
+          {:error, :enoent} ->
+            #FIXME close opened afds
+            throw :retry
+        end
+
+      disktable(filename: filename, index: index, generation: generation) ->
+        case Afs.open(filename, [:read]) do
+          {:ok, afd} ->
+            {_, offset} = element(1, index)
+            {_, next_offset} = element(2, index)
+
+            {pread_ref, afd} = Afs.pread(afd, offset, next_offset - offset)
+            pop({nil, generation, <<>>, {afd, pread_ref, index, 1, tuple_size(index)}})
+
+          {:error, :enoent} ->
+            #FIXME close opened afds
+            throw :retry
+        end
     end)
-    |> Enum.reject(& &1 == :done)
+    |> Enum.reject(&(&1 == :done))
     |> Enum.sort()
     |> simplify()
-    # |> tap(fn s -> IO.inspect Enum.map(s, &element(1, &1)), label: :after end)
   end
 
   defp simplify([{{k, _}, xgen, _, _} = xs, {{k, _}, ygen, _, _} = ys | rest]) when is_gen(xgen) and is_gen(ygen) and xgen < ygen do

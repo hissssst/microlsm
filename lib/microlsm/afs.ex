@@ -13,13 +13,13 @@ defmodule Microlsm.Afs do
     cap: nil
 
   @type t :: {
-    :afd,
-    pid :: pid(),
-    ref ::  reference(),
-    level ::  non_neg_integer(),
-    preads :: [reference()],
-    cap ::  pos_integer()
-  }
+          :afd,
+          pid :: pid(),
+          ref :: reference(),
+          level :: non_neg_integer(),
+          preads :: [reference()],
+          cap :: pos_integer()
+        }
 
   @opaque reply_ref :: reference()
 
@@ -28,14 +28,15 @@ defmodule Microlsm.Afs do
     ref = make_ref()
     owner = self()
     start_ref = make_ref()
+
     pid =
       spawn_link(fn ->
         case Fs.open(filename, modes) do
-         {:ok, fd} ->
+          {:ok, fd} ->
             send(owner, {start_ref, :ok})
             loop(fd, ref, owner)
 
-         {:error, _} = error ->
+          {:error, _} = error ->
             send(owner, {start_ref, error})
             :done
         end

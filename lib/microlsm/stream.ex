@@ -76,7 +76,16 @@ defmodule Microlsm.Stream do
               do_merge(left_key, left_value, right_key, right_value, done_clos(), rclos, acc, fun)
 
             {_, {right_key, right_value}} ->
-              do_merge(left_key, left_value, right_key, right_value, done_clos(), done_clos(), acc, fun)
+              do_merge(
+                left_key,
+                left_value,
+                right_key,
+                right_value,
+                done_clos(),
+                done_clos(),
+                acc,
+                fun
+              )
 
             {_, []} ->
               dump(left_key, left_value, done_clos(), acc, fun)
@@ -131,6 +140,7 @@ defmodule Microlsm.Stream do
     case left_key do
       left_key when left_key < right_key ->
         acc = fun.({left_key, left_value}, iacc)
+
         case lclos.({:cont, []}) do
           {:suspended, {left_key, left_value}, lclos} ->
             do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun)
@@ -144,6 +154,7 @@ defmodule Microlsm.Stream do
 
       left_key when left_key == right_key ->
         acc = {:cont, iacc}
+
         case rclos.({:cont, []}) do
           {:suspended, {right_key, right_value}, rclos} ->
             do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun)
@@ -157,6 +168,7 @@ defmodule Microlsm.Stream do
 
       left_key when left_key > right_key ->
         acc = fun.({right_key, right_value}, iacc)
+
         case rclos.({:cont, []}) do
           {:suspended, {right_key, right_value}, rclos} ->
             do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun)
@@ -170,14 +182,26 @@ defmodule Microlsm.Stream do
     end
   end
 
-  defp do_merge(_left_key, _left_value, _right_key, _right_value, lclos, rclos, {:halt, iacc}, _fun) do
+  defp do_merge(
+         _left_key,
+         _left_value,
+         _right_key,
+         _right_value,
+         lclos,
+         rclos,
+         {:halt, iacc},
+         _fun
+       ) do
     lclos.({:halt, iacc})
     rclos.({:halt, iacc})
     {:halted, iacc}
   end
 
   defp do_merge(left_key, left_value, right_key, right_value, lclos, rclos, {:suspend, iacc}, fun) do
-    cont = fn acc -> do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun) end
+    cont = fn acc ->
+      do_merge(left_key, left_value, right_key, right_value, lclos, rclos, acc, fun)
+    end
+
     {:suspended, iacc, cont}
   end
 

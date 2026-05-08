@@ -15,9 +15,8 @@ defmodule Microlsm.MixProject do
       name: "Microlsm",
       start_permanent: Mix.env() == :prod,
       source_url: @source_url,
-      deps:  [
+      deps: [
         {:odcounter, "~> 2.0"},
-
         {:stream_data, "~> 1.2", only: [:test]},
         {:eflambe, "~> 0.3.2", only: [:dev, :test]},
         {:ex_doc, "~> 0.28", only: :dev, runtime: false},

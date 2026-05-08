@@ -1,11 +1,12 @@
 defmodule Microlsm.FuzzTest do
-  use ExUnit.Case
+  use ExUnit.Case, async: false
   import StreamData
+  import Microlsm.Test.Support
 
   @moduletag fuzz: true, timeout: :infinity
 
   setup do
-    {:ok, Microlsm.Test.Support.setup_datadir()}
+    {:ok, setup_datadir()}
   end
 
   defp x do
@@ -83,11 +84,11 @@ defmodule Microlsm.FuzzTest do
   test "Fuzz multi key", %{name: name, data_dir: data_dir} do
     test_length = 128 * 1024
     threshold = 1024
-    kill_every = 250
+    kill_every = 128
 
     {:ok, _pid} =
       Microlsm.start_link(
-        allow_overflow: true,
+        allow_overflow: false,
         name: name,
         data_dir: data_dir,
         threshold: threshold
@@ -103,24 +104,27 @@ defmodule Microlsm.FuzzTest do
         {kill_every, fixed_list([:write, name, key, value])},
         {kill_every, fixed_list([:delete, name, key])},
         # {kill_every, fixed_list([:batch, name, batch(key, value)])},
-        # {2, :kill}
+        {2, :kill}
       ]
 
     import StreamData, only: []
 
     # start_watcher(name)
+    start_rps()
 
     ops =
       stream
       |> Stream.take(test_length)
       |> Enum.reduce([], fn entry, acc ->
-        IO.write "."
+        # IO.write "."
         case entry do
           [op | args] ->
             apply(ReferenceStore, op, args)
             apply(Microlsm, op, args)
+            bump_rps()
 
           :kill ->
+            print_rps()
             pid = Process.whereis(name)
             Process.unlink(pid)
 
@@ -135,6 +139,7 @@ defmodule Microlsm.FuzzTest do
               )
 
             check(name, [:kill | acc])
+            start_rps()
         end
 
         [entry | acc]
@@ -265,6 +270,7 @@ defmodule Microlsm.FuzzTest do
 
     {:ok, _pid} =
       Microlsm.start_link(
+        allow_overflow: false,
         name: name,
         data_dir: data_dir,
         threshold: threshold,
@@ -297,12 +303,15 @@ defmodule Microlsm.FuzzTest do
 
     IO.inspect data_dir
 
+    start_rps()
+
     {_, ops} =
       stream
       |> Stream.take(test_length)
       |> Enum.reduce({first_value, []}, fn entry, {old_value, acc} ->
         case entry do
           :kill ->
+            print_rps()
             pid = Process.whereis(name)
             Process.unlink(pid)
 
@@ -319,6 +328,7 @@ defmodule Microlsm.FuzzTest do
 
             acc = [:kill | acc]
             check(name, acc)
+            start_rps()
             {old_value, acc}
 
           :all ->
@@ -334,6 +344,8 @@ defmodule Microlsm.FuzzTest do
 
             assert {:ok, ^value} = Microlsm.read(name, key)
             assert {:ok, ^value} = ReferenceStore.read(name, key)
+
+            bump_rps()
 
             {value, [[:write, name, key, value] | acc]}
         end
@@ -370,15 +382,17 @@ defmodule Microlsm.FuzzTest do
 
     stream =
       frequency [
-        {1 * kill_every, fixed_list([:write, name, key, value])},
-        {4, :kill},
-        {1 * kill_every, fixed_list([:delete, name, key])},
-        # {10 * kill_every, fixed_list([:batch, name, batch])},
+        {5 * kill_every, fixed_list([:write, name, key, value])},
+        {5 * kill_every, fixed_list([:delete, name, key])},
+        {1 * kill_every, fixed_list([:batch, name, batch])},
         {1 * kill_every, fixed_list([:range_read, name, key, key])},
-        {1 * kill_every, fixed_list([:all, name])}
+        {1 * kill_every, fixed_list([:all, name])},
+        {13, :kill}
       ]
 
     IO.inspect data_dir
+
+    start_rps()
 
     ops =
       stream
@@ -393,6 +407,7 @@ defmodule Microlsm.FuzzTest do
       |> Enum.reduce([], fn entry, acc ->
         case entry do
           :kill ->
+            print_rps()
             pid = Process.whereis(name)
             Process.unlink(pid)
 
@@ -408,8 +423,10 @@ defmodule Microlsm.FuzzTest do
               )
 
             check(name, acc)
+            start_rps()
 
           [op | args] when op in [:all, :range_read] ->
+            print_rps()
             reference = Enum.to_list(apply(ReferenceStore, op, args))
             microlsm = Enum.to_list(apply(Microlsm, op, args))
 
@@ -442,9 +459,11 @@ defmodule Microlsm.FuzzTest do
 
               assert false
             end
+            start_rps()
 
           [op | args] ->
             assert apply(ReferenceStore, op, args) == apply(Microlsm, op, args)
+            bump_rps()
         end
 
         [entry | acc]
@@ -452,23 +471,5 @@ defmodule Microlsm.FuzzTest do
 
     check(name, ops)
     Microlsm.Stats.print(name)
-  end
-
-  defp start_watcher(name) do
-    owner = self()
-    spawn(fn -> watcher_loop(owner, name) end)
-  end
-
-  defp watcher_loop(owner, name) do
-    pid = Process.whereis(name)
-    IO.inspect Process.info(pid, :current_stacktrace)
-    {:links, links} = Process.info(pid, :links)
-
-    for link <- links, link != owner do
-      IO.inspect Process.info(link, :current_stacktrace), label: inspect(link)
-    end
-
-    Process.sleep(500)
-    watcher_loop(owner, name)
   end
 end

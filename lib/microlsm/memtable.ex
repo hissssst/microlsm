@@ -45,6 +45,7 @@ defmodule Microlsm.Memtable do
   def range_read(memtable, left_key, right_key, read_ahead) do
     # Ex2ms.fun do {key, value} when key >= left_key and key <= right_key -> {key, value} end
     selector = [{{:"$1", :"$2"}, [{:andalso, {:>=, :"$1", left_key}, {:"=<", :"$1", right_key}}], [{{:"$1", :"$2"}}]}]
+
     do_stream(memtable, selector, read_ahead)
   end
 

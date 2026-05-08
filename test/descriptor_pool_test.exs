@@ -30,7 +30,11 @@ defmodule Microlsm.DescriptorPoolTest do
       result =
         DescriptorPool.checkout(pool, state, fn _ ->
           send(owner, {:cell, self()})
-          receive do :finish -> :finish end
+
+          receive do
+            :finish -> :finish
+          end
+
           :some_result
         end)
 
